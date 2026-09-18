@@ -700,6 +700,7 @@ void serialPortReading() {
       Serial.println("Переход в режим конфигурации...");
       Serial.println("Плата перезагружается...");
       Serial.println("Подключитесь к сети Wi-Fi: ArtWAT_system");
+      Serial.println("Если вы автоматически не перевелись на страницу настройки то:");
       Serial.println("Откройте браузер и перейдите по адресу: http://192.168.4.1");
 
       delay(1000);
@@ -723,6 +724,7 @@ void serialPortReading() {
       Serial.println("/light_off - выключить свет");
       Serial.println("/reboot_system - перезагрузить систему");
       Serial.println("/exit_on_config_mode - режим конфигурации");
+      Serial.println("/delete_system_data - удалить данные из памяти");
       Serial.println("/help - показать справку команд");
       Serial.println("=========================");
     }
@@ -745,6 +747,14 @@ void serialPortReading() {
     else if (incomingString == "/light_off") {
       stopLight();
       Serial.println("Свет ВЫКЛЮЧЕН");
+    }
+
+    else if (incomingString == "/delete_system_data") {
+      deleteSystemData();
+      Serial.println("Системные данные очищены...");
+      Serial.println("Введите новые системные данные для подключения/работы");
+      Serial.println("в режиме конфигурации системы."); Serial.println();
+      Serial.println("Комманда режима конфигурации: /exit_on_config_mode.");
     }
 
     // ===== НЕИЗВЕСТНАЯ КОМАНДА =====
