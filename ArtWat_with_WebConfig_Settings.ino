@@ -18,8 +18,8 @@
 //  - За счёт использования кастомной библиотеки в код не выносятся HTTP и Json 
 //  настройки, которые сильно ухудшали визуал и чтение кода.
 //  - В случае неполадок в работе сервисов VK или внутренних поломок считывать показания
-//  и управлять системой можно с помощью Serial монитора, отправляя команды через кабель
-//  на микроконтроллер напрямую.
+//  и управлять системой можно с помощью Serial монитора, войдя в режим администратора 
+//  отправляя команды через кабель на микроконтроллер напрямую.
 // 
 
 
@@ -33,6 +33,7 @@
 
 const char* AP_SSID = "ArtWAT_system";
 const char* AP_PASSWORD = "12345678";
+const String SERIAL_PASSWORD = "3468#2550";  // ← Пароль от режима разроботчика
 
 const int IO_PIN = 19;
 const int SCLK_PIN = 18;
@@ -67,6 +68,9 @@ bool lightState = false;
 bool pumpState = false;
 unsigned long lightStartTime = 0;
 unsigned long pumpStartTime = 0;
+bool waitingForDeleteConfirm = false;
+bool serialAuthorized = false;
+bool greeted = false;
 
 String MainMenu;
 String SettingsMenu;
@@ -308,6 +312,16 @@ void startConfigMode() {
   
   server.begin();
   Serial.println("📡 Точка доступа успешно поднята: ArtWAT_system");
+}
+
+void deleteSystemData() {
+  // чистка данных из памяти
+  preferences.begin("bot-config", false);
+  preferences.clear();
+  preferences.end();
+
+  delay(1500);
+  ESP.restart();
 }
 
 void startNormalMode() {
@@ -658,10 +672,64 @@ void serialPortReading() {
     String incomingString = Serial.readStringUntil('\n');
     incomingString.trim();
 
+    // ===== АВТОРИЗАЦИЯ =====
+    if (!serialAuthorized) {
+      if (incomingString == "/login") {
+        Serial.println("🔐 Введите пароль:");
+      }
+      else if (incomingString == SERIAL_PASSWORD) {
+        serialAuthorized = true;
+
+        Serial.println("✅ Доступ разрешён!");
+        Serial.println("Введите /help для списка команд");
+      }
+      else {
+        Serial.println("❌ Доступ запрещён!");
+        Serial.println("Авторизируйтесь для использования комманд.");
+        Serial.println();
+        Serial.println("Введите /login для входа.");
+      }
+      return;
+    }
+
+    // ===== ЗАПРОС НА УДАЛЕНИЕ =====
+    if (incomingString == "/delete_system_data") {
+      waitingForDeleteConfirm = true;
+
+      Serial.println("Вы удаляете все сохранённые системные данные");
+      Serial.println("Вы УВЕРЕНЫ в том что сбрасываете систему до заводских настроек?");
+      Serial.println("Введите команду /agree чтобы подтвердить действие, или");
+      Serial.println("введите любую другую команду чтобы отменить сброс.");
+    }
+
+    // ===== ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ =====
+    else if (waitingForDeleteConfirm) {
+      if (incomingString == "/agree") {
+        waitingForDeleteConfirm = false;
+
+        Serial.println("Ввод подтверждён ✅");
+        Serial.println("Системные данные очищены...");
+        Serial.println();
+        Serial.println("Введите новые системные данные для подключения/работы");
+        Serial.println("в режиме конфигурации системы.");
+        Serial.println();
+        Serial.println("Комманда режима конфигурации: /exit_on_config_mode.");
+
+        deleteSystemData();
+      } else {
+        waitingForDeleteConfirm = false;
+
+        Serial.println("Ввод отменём, в сбросе отказано ❌");
+        Serial.println();
+        Serial.println("Введите /help для списка команд");
+      }
+    }
+
     // ===== ПРОВЕРКА ПАРАМЕТРОВ =====
-    if (incomingString == "/check_parametrs") {
+    else if (incomingString == "/check_parametrs") {
       Serial.println("Выполняю проверку параметров...");
       Serial.println();
+      Serial.println("=== ПАРАМЕТРЫ СИСТЕМЫ ===");
       Serial.print("Время полива: "); Serial.println(waterTime);
       Serial.print("Длительность полива: "); Serial.println(String(water_duration_value / 60000));
       Serial.println();
@@ -669,6 +737,7 @@ void serialPortReading() {
       Serial.print("Длительность света: "); Serial.println(String(light_duration_value / 3600));
       Serial.println();
       Serial.print("Режим системы: "); Serial.println(configMode ? "Ожидание Сети..." : "Рабочий");
+      Serial.println("=========================");
     }
 
     // ===== ТЕСТ РЕЛЕ =====
@@ -682,7 +751,6 @@ void serialPortReading() {
         digitalWrite(4, LOW);
         delay(500);
       }
-      // Выключаем всё после теста
       digitalWrite(4, LOW);
       digitalWrite(5, LOW);
       Serial.println("✅ Тест реле завершен");
@@ -691,6 +759,9 @@ void serialPortReading() {
     // ===== ПЕРЕЗАГРУЗКА =====
     else if (incomingString == "/reboot_system") {
       Serial.println("Перезагрузка системы...");
+      Serial.println("После перезагрузки нужно будет повторно авторизироваться.");
+      Serial.println("Команда чтобы авторизироваться - /login");
+      Serial.println("-----");
       delay(500);
       ESP.restart();
     }
@@ -700,8 +771,8 @@ void serialPortReading() {
       Serial.println("Переход в режим конфигурации...");
       Serial.println("Плата перезагружается...");
       Serial.println("Подключитесь к сети Wi-Fi: ArtWAT_system");
-      Serial.println("Если вы автоматически не перевелись на страницу настройки то:");
       Serial.println("Откройте браузер и перейдите по адресу: http://192.168.4.1");
+      Serial.println("-----");
 
       delay(1000);
 
@@ -711,6 +782,14 @@ void serialPortReading() {
 
       delay(500);
       ESP.restart();
+    }
+
+    // ===== ВЫХОД ИЗ РЕЖИМА АДМИНИСТРАТОРА =====
+    else if (incomingString == "/logout") {
+      serialAuthorized = false;
+
+      Serial.println("Вы вышли из режима администратора");
+      GreetingSerial();
     }
 
     // ===== СПРАВКА =====
@@ -724,7 +803,8 @@ void serialPortReading() {
       Serial.println("/light_off - выключить свет");
       Serial.println("/reboot_system - перезагрузить систему");
       Serial.println("/exit_on_config_mode - режим конфигурации");
-      Serial.println("/delete_system_data - удалить данные из памяти");
+      Serial.println("/delete_system_data - сбросить до заводских настроек");
+      Serial.println("/logout - выйти из режима администратора");
       Serial.println("/help - показать справку команд");
       Serial.println("=========================");
     }
@@ -733,28 +813,24 @@ void serialPortReading() {
     else if (incomingString == "/pump_on") {
       startPump();
       Serial.println("Насос ВКЛЮЧЕН");
+      Serial.println("-----");
     }
     else if (incomingString == "/pump_off") {
       stopPump();
       Serial.println("Насос ВЫКЛЮЧЕН");
+      Serial.println("-----");
     }
 
     // ===== УПРАВЛЕНИЕ СВЕТОМ =====
     else if (incomingString == "/light_on") {
       startLight();
       Serial.println("Свет ВКЛЮЧЕН");
+      Serial.println("-----");
     }
     else if (incomingString == "/light_off") {
       stopLight();
       Serial.println("Свет ВЫКЛЮЧЕН");
-    }
-
-    else if (incomingString == "/delete_system_data") {
-      deleteSystemData();
-      Serial.println("Системные данные очищены...");
-      Serial.println("Введите новые системные данные для подключения/работы");
-      Serial.println("в режиме конфигурации системы."); Serial.println();
-      Serial.println("Комманда режима конфигурации: /exit_on_config_mode.");
+      Serial.println("-----");
     }
 
     // ===== НЕИЗВЕСТНАЯ КОМАНДА =====
@@ -762,6 +838,7 @@ void serialPortReading() {
       Serial.print("❌ Неизвестная команда: ");
       Serial.println(incomingString);
       Serial.println("Введите /help для списка команд");
+      Serial.println("-----");
     }
 
   }
@@ -769,15 +846,15 @@ void serialPortReading() {
 // -----------------------------
 
 void GreetingSerial() {
+  delay(2000);
   Serial.println("=== ArtWat system ===");
-  Serial.println("Введите комманду или");
-  Serial.println("отправьте /help чтобы ознакомится с командами");
+  Serial.println("Войдите в режим разработчика чтобы системно управлять параметрами.");
+  Serial.println("Команда чтобы авторизироваться - /login");
   Serial.println("=====================");
 }
 
 void setup() {
   Serial.begin(115200);
-  GreetingSerial();
 
   pinMode(PUMP_PIN, OUTPUT);
   pinMode(LIGHT_PIN, OUTPUT);
@@ -812,4 +889,23 @@ void loop() {
     }
   }
   delay(10);
+
+  // --- Улучшенная проверка монитора порта без delay() ---
+  static unsigned long portOpenedTime = 0; // Время, когда порт открылся
+
+  if (Serial) {
+    if (!greeted) {
+      if (portOpenedTime == 0) {
+        portOpenedTime = millis(); // Засекаем время открытия
+      }
+      // Ждем 200 мс неблокирующим способом
+      if (millis() - portOpenedTime >= 200) {
+        GreetingSerial();
+        greeted = true;
+      }
+    }
+  } else {
+    greeted = false;
+    portOpenedTime = 0; // Сбрасываем таймер
+  }
 }
