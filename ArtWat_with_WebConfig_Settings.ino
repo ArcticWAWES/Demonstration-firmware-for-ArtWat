@@ -1,11 +1,12 @@
 // -------------------------------  СИСТЕМА АВТОПОЛИВА  -------------------------------
-//                             ДЛЯ АВТОНОМНОГО ИСПОЛЬЗОВАНИЯ
+//                             ДЛЯ ПОЛУАВТОНОМНОГО ИСПОЛЬЗОВАНИЯ
 //                              УПРАВЛЯЕМАЯ VK СООБЩЕСТВОМ
 //                             НА БАЗЕ КАСТОМНОЙ БИБЛИОТЕКИ
 //                                    "VKassistent"
 //                                   by Arctic_WAWES
 // 
-//  Прошивка для серии моделей ArtWat BETA/DEMO (home edition) 
+//  Прошивка для серии моделей ArtWat BETA/DEMO (home edition)
+//  Firmwork version: 1.1.3 DEMO
 // 
 //  Автономная система автоматического полива, управляемая с помощью VK сообщества (бота).
 //  Взаимодействия происходят с помощью авторской библиотеки "VKassistent" и созданного
@@ -20,8 +21,8 @@
 //  - В случае неполадок в работе сервисов VK или внутренних поломок считывать показания
 //  и управлять системой можно с помощью Serial монитора, войдя в режим администратора 
 //  отправляя команды через кабель на микроконтроллер напрямую.
-// 
-
+//  - Автосохранение всех внесённых парамтеров, начиная от системного времени, заканчивая
+//  временем включения насоса, лампы и т.д.
 
 #include <VKassistent.h>
 #include <ThreeWire.h>
@@ -32,8 +33,8 @@
 #include <Preferences.h>
 
 const char* AP_SSID = "ArtWAT_system";
-const char* AP_PASSWORD = "12345678";
-const String SERIAL_PASSWORD = "3468#2550";  // ← Пароль от режима разроботчика
+const char* AP_PASSWORD = "12345678";        // ← Пароль от точки доступа (режима конфиграции)
+const String SERIAL_PASSWORD = "3468#2550";  // ← Пароль от режима разработчика
 
 const int IO_PIN = 19;
 const int SCLK_PIN = 18;
@@ -247,9 +248,17 @@ void loadSettings() {
   preferences.begin("bot-config", true);
   String stored_ssid = preferences.getString("ssid", "");
   bool goto_config = preferences.getBool("goto_config", false);
+  
   if (stored_ssid.length() == 0 || goto_config) {
     configMode = true;
   }
+  
+  // ===== ЗАГРУЖАЕМ ПАРАМЕТРЫ ПОЛИВА И СВЕТА =====
+  waterTime = preferences.getString("water_time", "09:00");
+  lightTime = preferences.getString("light_time", "18:00");
+  water_duration_value = preferences.getInt("water_duration", 0);
+  light_duration_value = preferences.getInt("light_duration", 0);
+  
   preferences.end();
 }
 
@@ -262,6 +271,12 @@ void handleSave() {
     preferences.putString("token", server.arg("token"));
     preferences.putString("group_id", server.arg("group_id"));
     preferences.putBool("goto_config", false);
+    
+    // ===== СОХРАНЯЕМ ПАРАМЕТРЫ ПОЛИВА И СВЕТА =====
+    preferences.putString("water_time", waterTime);
+    preferences.putString("light_time", lightTime);
+    preferences.putInt("water_duration", water_duration_value);
+    preferences.putInt("light_duration", light_duration_value);
     
     int adminCount = 0;
     for (int i = 0; i < 10; i++) {
@@ -321,6 +336,7 @@ void deleteSystemData() {
   preferences.end();
 
   delay(1500);
+  Serial.flush();
   ESP.restart();
 }
 
@@ -412,7 +428,7 @@ void startNormalMode() {
     Button("НАЗАД↩️", primary)
   );
 
-  // Обработчики для ввода времени
+  // Обработчики для ввода времени (с автосохранением)
   for (int i = 0; i < 24; i++) {
     char buf[16];
     sprintf(buf, "%02d:00", i);
@@ -422,6 +438,12 @@ void startNormalMode() {
       if (waitingForWaterTime && UserID == waitingUserId) {
         waitingForWaterTime = false;
         waterTime = timeStr;
+        
+        // ===== АВТОСОХРАНЕНИЕ =====
+        preferences.begin("bot-config", false);
+        preferences.putString("water_time", waterTime);
+        preferences.end();
+        
         current_keyboard = "WateringMenu";
         bot->sendWithKeyboard(UserID, "✅ Время полива установлено: " + waterTime, WateringMenu);
         return;
@@ -429,6 +451,12 @@ void startNormalMode() {
       if (waitingForLightTime && UserID == waitingLightUserId) {
         waitingForLightTime = false;
         lightTime = timeStr;
+        
+        // ===== АВТОСОХРАНЕНИЕ =====
+        preferences.begin("bot-config", false);
+        preferences.putString("light_time", lightTime);
+        preferences.end();
+        
         current_keyboard = "LightingMenu";
         bot->sendWithKeyboard(UserID, "✅ Время включения света установлено: " + lightTime, LightingMenu);
         return;
@@ -540,10 +568,13 @@ void startNormalMode() {
     }
   });
 
-  // Обработчики для длительности полива
+  // Обработчики для длительности полива (с автосохранением)
   bot->proccesMessage("1 минуту", [](long UserID, String text) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 60000;
+      preferences.begin("bot-config", false);
+      preferences.putInt("water_duration", water_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность полива: 1 минута", WateringMenu);
       current_keyboard = "WateringMenu";
     }
@@ -552,6 +583,9 @@ void startNormalMode() {
   bot->proccesMessage("2 минуты", [](long UserID, String text) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 120000;
+      preferences.begin("bot-config", false);
+      preferences.putInt("water_duration", water_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность полива: 2 минуты", WateringMenu);
       current_keyboard = "WateringMenu";
     }
@@ -560,6 +594,9 @@ void startNormalMode() {
   bot->proccesMessage("3 минуты", [](long UserID, String text) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 180000;
+      preferences.begin("bot-config", false);
+      preferences.putInt("water_duration", water_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность полива: 3 минуты", WateringMenu);
       current_keyboard = "WateringMenu";
     }
@@ -568,6 +605,9 @@ void startNormalMode() {
   bot->proccesMessage("5 минут", [](long UserID, String text) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 300000;
+      preferences.begin("bot-config", false);
+      preferences.putInt("water_duration", water_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность полива: 5 минут", WateringMenu);
       current_keyboard = "WateringMenu";
     }
@@ -576,15 +616,21 @@ void startNormalMode() {
   bot->proccesMessage("10 минут", [](long UserID, String text) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 600000;
+      preferences.begin("bot-config", false);
+      preferences.putInt("water_duration", water_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность полива: 10 минут", WateringMenu);
       current_keyboard = "WateringMenu";
     }
   });
 
-  // Обработчики для длительности света
+  // Обработчики для длительности света (с автосохранением)
   bot->proccesMessage("2 часа", [](long UserID, String text) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 7200;
+      preferences.begin("bot-config", false);
+      preferences.putInt("light_duration", light_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность света: 2 часа", LightingMenu);
       current_keyboard = "LightingMenu";
     }
@@ -593,6 +639,9 @@ void startNormalMode() {
   bot->proccesMessage("4 часа", [](long UserID, String text) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 14400;
+      preferences.begin("bot-config", false);
+      preferences.putInt("light_duration", light_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность света: 4 часа", LightingMenu);
       current_keyboard = "LightingMenu";
     }
@@ -601,6 +650,9 @@ void startNormalMode() {
   bot->proccesMessage("6 часов", [](long UserID, String text) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 21600;
+      preferences.begin("bot-config", false);
+      preferences.putInt("light_duration", light_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность света: 6 часов", LightingMenu);
       current_keyboard = "LightingMenu";
     }
@@ -609,6 +661,9 @@ void startNormalMode() {
   bot->proccesMessage("8 часов", [](long UserID, String text) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 28800;
+      preferences.begin("bot-config", false);
+      preferences.putInt("light_duration", light_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность света: 8 часов", LightingMenu);
       current_keyboard = "LightingMenu";
     }
@@ -617,6 +672,9 @@ void startNormalMode() {
   bot->proccesMessage("12 часов", [](long UserID, String text) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 43200;
+      preferences.begin("bot-config", false);
+      preferences.putInt("light_duration", light_duration_value);
+      preferences.end();
       bot->sendWithKeyboard(UserID, "✅ Длительность света: 12 часов", LightingMenu);
       current_keyboard = "LightingMenu";
     }
@@ -740,6 +798,25 @@ void serialPortReading() {
       Serial.println("=========================");
     }
 
+    // ===== СОХРАНЕНИЕ ПАРАМЕТРОВ =====
+    else if (incomingString == "/save_params") {
+      preferences.begin("bot-config", false);
+      preferences.putString("water_time", waterTime);
+      preferences.putString("light_time", lightTime);
+      preferences.putInt("water_duration", water_duration_value);
+      preferences.putInt("light_duration", light_duration_value);
+      preferences.end();
+      
+      Serial.println("✅ Параметры сохранены в память!");
+      Serial.println();
+      Serial.print("Время полива: "); Serial.println(waterTime);
+      Serial.print("Длительность полива: "); Serial.println(String(water_duration_value / 60000) + " мин");
+      Serial.println();
+      Serial.print("Время света: "); Serial.println(lightTime);
+      Serial.print("Длительность света: "); Serial.println(String(light_duration_value / 3600) + " ч");
+      Serial.println("-----");
+    }
+
     // ===== ТЕСТ РЕЛЕ =====
     else if (incomingString == "/relay_test") {
       Serial.println("Выполняю проверку выходов...");
@@ -796,6 +873,7 @@ void serialPortReading() {
     else if (incomingString == "/help") {
       Serial.println("=== ДОСТУПНЫЕ КОМАНДЫ ===");
       Serial.println("/check_parametrs - показать все параметры");
+      Serial.println("/save_params - сохранить параметры в память");
       Serial.println("/relay_test - тест реле");
       Serial.println("/pump_on - включить насос");
       Serial.println("/pump_off - выключить насос");
@@ -846,7 +924,6 @@ void serialPortReading() {
 // -----------------------------
 
 void GreetingSerial() {
-  delay(2000);
   Serial.println("=== ArtWat system ===");
   Serial.println("Войдите в режим разработчика чтобы системно управлять параметрами.");
   Serial.println("Команда чтобы авторизироваться - /login");
@@ -888,24 +965,19 @@ void loop() {
       lastCheck = millis();
     }
   }
-  delay(10);
 
-  // --- Улучшенная проверка монитора порта без delay() ---
-  static unsigned long portOpenedTime = 0; // Время, когда порт открылся
+  // --- Проверка монитора порта без delay() ---
+  static unsigned long portOpenedTime = 0;
 
-  if (Serial) {
-    if (!greeted) {
-      if (portOpenedTime == 0) {
-        portOpenedTime = millis(); // Засекаем время открытия
-      }
-      // Ждем 200 мс неблокирующим способом
-      if (millis() - portOpenedTime >= 200) {
-        GreetingSerial();
-        greeted = true;
-      }
+  if (!greeted) {
+    if (portOpenedTime == 0) {
+      portOpenedTime = millis();
     }
-  } else {
-    greeted = false;
-    portOpenedTime = 0; // Сбрасываем таймер
+    if (millis() - portOpenedTime >= 200) {
+      GreetingSerial();
+      greeted = true;
+    }
   }
+
+  yield();
 }
