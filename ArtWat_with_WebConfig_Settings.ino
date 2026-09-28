@@ -1,18 +1,14 @@
 // -------------------------------  СИСТЕМА АВТОПОЛИВА  -------------------------------
-//                             ДЛЯ ПОЛУАВТОНОМНОГО ИСПОЛЬЗОВАНИЯ
+//                             ДЛЯ АВТОНОМНОГО ИСПОЛЬЗОВАНИЯ
 //                              УПРАВЛЯЕМАЯ VK СООБЩЕСТВОМ
 //                             НА БАЗЕ КАСТОМНОЙ БИБЛИОТЕКИ
 //                                    "VKassistent"
 //                                   by Arctic_WAWES
 // 
-//  Прошивка для серии моделей ArtWat BETA/DEMO (home edition)
-//  Firmwork version: 1.1.3 DEMO
+//  Прошивка для серии моделей ArtWat (home edition) 
+//  Firmwork version: 1.2 DEMO
 // 
-//  Автономная система автоматического полива, управляемая с помощью VK сообщества (бота).
-//  Взаимодействия происходят с помощью авторской библиотеки "VKassistent" и созданного
-//  пользователем сообществом в котором находится непосредственно сам бот.
-// 
-//  Особенности:
+//   Особенности:
 //  - Подключение устройства происходит с помощью локальной HTML страницы, открываемой после
 //  подключения к создаваемой микроконтроллером точке доступа, на ней вводятся параметры
 //  сети WiFi и пользовательского VK сообщества.
@@ -20,9 +16,32 @@
 //  настройки, которые сильно ухудшали визуал и чтение кода.
 //  - В случае неполадок в работе сервисов VK или внутренних поломок считывать показания
 //  и управлять системой можно с помощью Serial монитора, войдя в режим администратора 
-//  отправляя команды через кабель на микроконтроллер напрямую.
-//  - Автосохранение всех внесённых парамтеров, начиная от системного времени, заканчивая
+//  отправляя команды через кабель на микроконтроллер напрямую с любого устройства.
+//  - Автосохранение всех внесённых параметров, начиная от системного времени, заканчивая
 //  временем включения насоса, лампы и т.д.
+//  - ПОЛНЫЙ цикл автономной работы, при непредвиденной потери сети система входит в "FullAuto" 
+//  режим где насос и лампа включаются по системному времени внезависимости от наличия интернета,
+//  но функия работает только при внесённых параметрах полива и света, если они отсуствуют -
+//  система не будет включаться.
+//  
+// Распиновка модулей: 
+// RTC DS1302:
+//    VCC  →  3.3V
+//    GND  →  GND
+//    CLK  →  GPIO 18
+//    DAT  →  GPIO 19
+//    RST  →  GPIO 23
+//
+//  Реле 1 (Насос):
+//    VCC  →  5V
+//    GND  →  GND
+//    IN   →  GPIO 4
+//
+//  Реле 2 (Лампа):
+//    VCC  →  5V
+//    GND  →  GND
+//    IN   →  GPIO 5
+//
 
 #include <VKassistent.h>
 #include <ThreeWire.h>
@@ -31,10 +50,11 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
 
 const char* AP_SSID = "ArtWAT_system";
-const char* AP_PASSWORD = "12345678";        // ← Пароль от точки доступа (режима конфиграции)
-const String SERIAL_PASSWORD = "3468#2550";  // ← Пароль от режима разработчика
+const char* AP_PASSWORD = "3468#2550";
+const String SERIAL_PASSWORD = "3468#2550";
 
 const int IO_PIN = 19;
 const int SCLK_PIN = 18;
@@ -52,10 +72,16 @@ const byte DNS_PORT = 53;
 IPAddress apIP(192, 168, 4, 1);
 Preferences preferences;
 
+// ===== СОСТОЯНИЕ СИСТЕМЫ =====
+bool apMode = false;
+bool staConnected = false;
 bool configMode = false;
+unsigned long lastWifiAttempt = 0;
+unsigned long wifiLostTime = 0;
 
 VKassistent* bot = nullptr;
 
+// ===== ПАРАМЕТРЫ СИСТЕМЫ =====
 String current_keyboard = "MainMenu";
 String waterTime = "09:00";
 String lightTime = "18:00";
@@ -69,6 +95,8 @@ bool lightState = false;
 bool pumpState = false;
 unsigned long lightStartTime = 0;
 unsigned long pumpStartTime = 0;
+
+// ===== ФЛАГИ SERIAL =====
 bool waitingForDeleteConfirm = false;
 bool serialAuthorized = false;
 bool greeted = false;
@@ -79,6 +107,17 @@ String WateringMenu;
 String LightingMenu;
 String WaterDurationMenu;
 String LightDurationMenu;
+
+// ===== FORWARD DECLARATIONS =====
+void initBotAndMenus();
+void startAPMode();
+void stopAPMode();
+void tryConnectWiFi();
+void serialPortReading();
+void GreetingSerial();
+void deleteSystemData();
+
+// ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
 String getCurrentTime() {
   if (!Rtc.IsDateTimeValid()) return "00:00";
@@ -180,6 +219,8 @@ String getSystemStatus() {
   return status;
 }
 
+// ===== HTML СТРАНИЦА =====
+
 void handleRoot() {
   preferences.begin("bot-config", true);
   String s_ssid = preferences.getString("ssid", "");
@@ -253,7 +294,6 @@ void loadSettings() {
     configMode = true;
   }
   
-  // ===== ЗАГРУЖАЕМ ПАРАМЕТРЫ ПОЛИВА И СВЕТА =====
   waterTime = preferences.getString("water_time", "09:00");
   lightTime = preferences.getString("light_time", "18:00");
   water_duration_value = preferences.getInt("water_duration", 0);
@@ -272,7 +312,6 @@ void handleSave() {
     preferences.putString("group_id", server.arg("group_id"));
     preferences.putBool("goto_config", false);
     
-    // ===== СОХРАНЯЕМ ПАРАМЕТРЫ ПОЛИВА И СВЕТА =====
     preferences.putString("water_time", waterTime);
     preferences.putString("light_time", lightTime);
     preferences.putInt("water_duration", water_duration_value);
@@ -311,10 +350,16 @@ void handleSave() {
   }
 }
 
-void startConfigMode() {
+// ===== AP MODE =====
+
+void startAPMode() {
+  if (apMode) return;
+  
+  Serial.println("📡 Поднимаю точку доступа ArtWAT_system");
+  
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AP_SSID, nullptr);  // Без пароля
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
   
   dnsServer.start(DNS_PORT, "*", apIP);
   
@@ -326,11 +371,27 @@ void startConfigMode() {
   });
   
   server.begin();
-  Serial.println("📡 Точка доступа успешно поднята: ArtWAT_system");
+  apMode = true;
+  
+  Serial.print("📡 IP точки доступа: ");
+  Serial.println(WiFi.softAPIP());
 }
 
+void stopAPMode() {
+  if (!apMode) return;
+  
+  Serial.println("📡 Отключаю точку доступа");
+  
+  server.stop();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  
+  apMode = false;
+}
+
+// ===== СБРОС ДАННЫХ =====
+
 void deleteSystemData() {
-  // чистка данных из памяти
   preferences.begin("bot-config", false);
   preferences.clear();
   preferences.end();
@@ -340,50 +401,9 @@ void deleteSystemData() {
   ESP.restart();
 }
 
-void startNormalMode() {
-  preferences.begin("bot-config", true);
-  String ssid = preferences.getString("ssid", "");
-  String password = preferences.getString("password", "");
-  String token = preferences.getString("token", "");
-  String groupId = preferences.getString("group_id", "");
-  int adminCount = preferences.getInt("admin_count", 0);
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\n❌ Не удалось подключиться. Возврат в режим точки доступа.");
-    preferences.end();
-    configMode = true;
-    startConfigMode();
-    return;
-  }
-  
-  Serial.println("\n✅ Wi-Fi успешно подключен!");
-  
-  bot = new VKassistent(token, groupId);
-  bot->connectWIFI(ssid, password);
-  bot->begin();
-  
-  for (int i = 0; i < adminCount; i++) {
-    String pKey = "admin_" + String(i);
-    String adminStr = preferences.getString(pKey.c_str(), "0");
-    long adminID = strtol(adminStr.c_str(), NULL, 10);
-    bot->addAdmin(adminID);
-  }
-  
-  String firstAdminStr = preferences.getString("admin_0", "0");
-  long firstAdminID = strtol(firstAdminStr.c_str(), NULL, 10);
-  preferences.end();
+// ===== ИНИЦИАЛИЗАЦИЯ VK-БОТА И МЕНЮ =====
 
-  // Меню с эмодзи ПОСЛЕ текста
+void initBotAndMenus() {
   MainMenu = createKeyboard(
     Button("СТАТУС📊", secondary),
     Button("НАСТРОЙКИ⚙️", secondary),
@@ -428,7 +448,6 @@ void startNormalMode() {
     Button("НАЗАД↩️", primary)
   );
 
-  // Обработчики для ввода времени (с автосохранением)
   for (int i = 0; i < 24; i++) {
     char buf[16];
     sprintf(buf, "%02d:00", i);
@@ -438,12 +457,9 @@ void startNormalMode() {
       if (waitingForWaterTime && UserID == waitingUserId) {
         waitingForWaterTime = false;
         waterTime = timeStr;
-        
-        // ===== АВТОСОХРАНЕНИЕ =====
         preferences.begin("bot-config", false);
         preferences.putString("water_time", waterTime);
         preferences.end();
-        
         current_keyboard = "WateringMenu";
         bot->sendWithKeyboard(UserID, "✅ Время полива установлено: " + waterTime, WateringMenu);
         return;
@@ -451,12 +467,9 @@ void startNormalMode() {
       if (waitingForLightTime && UserID == waitingLightUserId) {
         waitingForLightTime = false;
         lightTime = timeStr;
-        
-        // ===== АВТОСОХРАНЕНИЕ =====
         preferences.begin("bot-config", false);
         preferences.putString("light_time", lightTime);
         preferences.end();
-        
         current_keyboard = "LightingMenu";
         bot->sendWithKeyboard(UserID, "✅ Время включения света установлено: " + lightTime, LightingMenu);
         return;
@@ -464,7 +477,6 @@ void startNormalMode() {
     });
   }
 
-  // Обновленные обработчики с новыми названиями кнопок
   bot->proccesMessage("НАСТРОЙКИ⚙️", [](long UserID, String text) {
     current_keyboard = "SettingsMenu";
     bot->sendWithKeyboard(UserID, "НАСТРОЙКИ⚙️\n\nВыберите раздел для редактирования параметров.", SettingsMenu);
@@ -488,7 +500,6 @@ void startNormalMode() {
     }
   });
 
-  // ОБНОВЛЕННЫЙ ОБРАБОТЧИК ДЛЯ ВРЕМЕНИ ПОЛИВА С РАСПИСАНИЕМ
   bot->proccesMessage("ВРЕМЯ ПОЛИВА💧🕐", [](long UserID, String text) {
     if (current_keyboard == "WateringMenu") {
       waitingForWaterTime = true;
@@ -524,7 +535,6 @@ void startNormalMode() {
     }
   });
 
-  // ОБНОВЛЕННЫЙ ОБРАБОТЧИК ДЛЯ ВРЕМЕНИ ВКЛЮЧЕНИЯ СВЕТА С РАСПИСАНИЕМ
   bot->proccesMessage("ВРЕМЯ ВКЛЮЧЕНИЯ💡🕐", [](long UserID, String text) {
     if (current_keyboard == "LightingMenu") {
       waitingForLightTime = true;
@@ -568,7 +578,6 @@ void startNormalMode() {
     }
   });
 
-  // Обработчики для длительности полива (с автосохранением)
   bot->proccesMessage("1 минуту", [](long UserID, String text) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 60000;
@@ -624,7 +633,6 @@ void startNormalMode() {
     }
   });
 
-  // Обработчики для длительности света (с автосохранением)
   bot->proccesMessage("2 часа", [](long UserID, String text) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 7200;
@@ -712,32 +720,102 @@ void startNormalMode() {
       bot->sendWithKeyboard(UserID, "ГЛАВНОЕ МЕНЮ🌱", MainMenu);
     }
   });
-
-  if (firstAdminID > 0) {
-    bot->sendWithKeyboard(firstAdminID, 
-      "🌱 Система автополива ArtWAT запущена!\n\n📅 Системное время:\n " + getCurrentDateTime() + "\n\nИспользуйте кнопки для управления.", 
-      MainMenu
-    );
-  }
 }
 
-// -----------------------------
-//  Функция чтения Serial порта для отправки и сбора информации с системы
-// -----------------------------
+// ===== ПОДКЛЮЧЕНИЕ К WI-FI =====
+
+void tryConnectWiFi() {
+  Serial.println("📶 Попытка подключения к Wi-Fi...");
+  
+  preferences.begin("bot-config", true);
+  String ssid = preferences.getString("ssid", "");
+  String password = preferences.getString("password", "");
+  preferences.end();
+  
+  if (ssid.length() == 0) {
+    Serial.println("⚠️ Wi-Fi не настроен.");
+    lastWifiAttempt = millis();
+    return;
+  }
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Wi-Fi подключен!");
+    Serial.print("🌐 IP: ");
+    Serial.println(WiFi.localIP());
+    staConnected = true;
+    
+    if (bot == nullptr) {
+      preferences.begin("bot-config", true);
+      String token = preferences.getString("token", "");
+      String groupId = preferences.getString("group_id", "");
+      int adminCount = preferences.getInt("admin_count", 0);
+      preferences.end();
+      
+      if (token.length() == 0 || groupId.length() == 0) {
+        Serial.println("❌ Токен или Group ID пустые!");
+        Serial.println("Откройте веб-интерфейс и введите данные.");
+        return;
+      }
+      
+      bot = new VKassistent(token, groupId);
+      bot->connectWIFI(ssid, password);
+      bot->begin();
+      
+      preferences.begin("bot-config", true);
+      for (int i = 0; i < adminCount; i++) {
+        String pKey = "admin_" + String(i);
+        String adminStr = preferences.getString(pKey.c_str(), "0");
+        long adminID = strtol(adminStr.c_str(), NULL, 10);
+        bot->addAdmin(adminID);
+      }
+      preferences.end();
+      
+      initBotAndMenus();
+      
+      preferences.begin("bot-config", true);
+      String firstAdminStr = preferences.getString("admin_0", "0");
+      preferences.end();
+      long firstAdminID = strtol(firstAdminStr.c_str(), NULL, 10);
+      
+      if (firstAdminID > 0) {
+        bot->sendWithKeyboard(firstAdminID, 
+          "🌱 Система автополива ArtWAT запущена!\n\n📅 Системное время:\n " + getCurrentDateTime() + "\n\nИспользуйте кнопки для управления.", 
+          MainMenu
+        );
+      }
+    }
+  } else {
+    Serial.println("\n❌ Не удалось подключиться.");
+    staConnected = false;
+  }
+  
+  lastWifiAttempt = millis();
+}
+
+// ===== SERIAL УПРАВЛЕНИЕ =====
+
 void serialPortReading() {
   if (Serial.available() > 0) {
 
     String incomingString = Serial.readStringUntil('\n');
     incomingString.trim();
 
-    // ===== АВТОРИЗАЦИЯ =====
     if (!serialAuthorized) {
       if (incomingString == "/login") {
         Serial.println("🔐 Введите пароль:");
       }
       else if (incomingString == SERIAL_PASSWORD) {
         serialAuthorized = true;
-
         Serial.println("✅ Доступ разрешён!");
         Serial.println("Введите /help для списка команд");
       }
@@ -750,21 +828,16 @@ void serialPortReading() {
       return;
     }
 
-    // ===== ЗАПРОС НА УДАЛЕНИЕ =====
     if (incomingString == "/delete_system_data") {
       waitingForDeleteConfirm = true;
-
       Serial.println("Вы удаляете все сохранённые системные данные");
       Serial.println("Вы УВЕРЕНЫ в том что сбрасываете систему до заводских настроек?");
       Serial.println("Введите команду /agree чтобы подтвердить действие, или");
       Serial.println("введите любую другую команду чтобы отменить сброс.");
     }
-
-    // ===== ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ =====
     else if (waitingForDeleteConfirm) {
       if (incomingString == "/agree") {
         waitingForDeleteConfirm = false;
-
         Serial.println("Ввод подтверждён ✅");
         Serial.println("Системные данные очищены...");
         Serial.println();
@@ -772,18 +845,14 @@ void serialPortReading() {
         Serial.println("в режиме конфигурации системы.");
         Serial.println();
         Serial.println("Комманда режима конфигурации: /exit_on_config_mode.");
-
         deleteSystemData();
       } else {
         waitingForDeleteConfirm = false;
-
         Serial.println("Ввод отменём, в сбросе отказано ❌");
         Serial.println();
         Serial.println("Введите /help для списка команд");
       }
     }
-
-    // ===== ПРОВЕРКА ПАРАМЕТРОВ =====
     else if (incomingString == "/check_parametrs") {
       Serial.println("Выполняю проверку параметров...");
       Serial.println();
@@ -794,11 +863,12 @@ void serialPortReading() {
       Serial.print("Время света: "); Serial.println(lightTime);
       Serial.print("Длительность света: "); Serial.println(String(light_duration_value / 3600));
       Serial.println();
-      Serial.print("Режим системы: "); Serial.println(configMode ? "Ожидание Сети..." : "Рабочий");
+      Serial.print("Режим системы: ");
+      if (apMode) Serial.println("AP Mode (точка доступа)");
+      else if (staConnected) Serial.println("STA Mode (Wi-Fi есть)");
+      else Serial.println("Автономный режим");
       Serial.println("=========================");
     }
-
-    // ===== СОХРАНЕНИЕ ПАРАМЕТРОВ =====
     else if (incomingString == "/save_params") {
       preferences.begin("bot-config", false);
       preferences.putString("water_time", waterTime);
@@ -808,16 +878,8 @@ void serialPortReading() {
       preferences.end();
       
       Serial.println("✅ Параметры сохранены в память!");
-      Serial.println();
-      Serial.print("Время полива: "); Serial.println(waterTime);
-      Serial.print("Длительность полива: "); Serial.println(String(water_duration_value / 60000) + " мин");
-      Serial.println();
-      Serial.print("Время света: "); Serial.println(lightTime);
-      Serial.print("Длительность света: "); Serial.println(String(light_duration_value / 3600) + " ч");
       Serial.println("-----");
     }
-
-    // ===== ТЕСТ РЕЛЕ =====
     else if (incomingString == "/relay_test") {
       Serial.println("Выполняю проверку выходов...");
       for (int i = 0; i < 10; i++) {
@@ -832,8 +894,6 @@ void serialPortReading() {
       digitalWrite(5, LOW);
       Serial.println("✅ Тест реле завершен");
     }
-
-    // ===== ПЕРЕЗАГРУЗКА =====
     else if (incomingString == "/reboot_system") {
       Serial.println("Перезагрузка системы...");
       Serial.println("После перезагрузки нужно будет повторно авторизироваться.");
@@ -842,34 +902,24 @@ void serialPortReading() {
       delay(500);
       ESP.restart();
     }
-
-    // ===== РЕЖИМ КОНФИГУРАЦИИ =====
     else if (incomingString == "/exit_on_config_mode") {
       Serial.println("Переход в режим конфигурации...");
       Serial.println("Плата перезагружается...");
       Serial.println("Подключитесь к сети Wi-Fi: ArtWAT_system");
       Serial.println("Откройте браузер и перейдите по адресу: http://192.168.4.1");
       Serial.println("-----");
-
       delay(1000);
-
       preferences.begin("bot-config", false);
       preferences.putBool("goto_config", true);
       preferences.end();
-
       delay(500);
       ESP.restart();
     }
-
-    // ===== ВЫХОД ИЗ РЕЖИМА АДМИНИСТРАТОРА =====
     else if (incomingString == "/logout") {
       serialAuthorized = false;
-
       Serial.println("Вы вышли из режима администратора");
       GreetingSerial();
     }
-
-    // ===== СПРАВКА =====
     else if (incomingString == "/help") {
       Serial.println("=== ДОСТУПНЫЕ КОМАНДЫ ===");
       Serial.println("/check_parametrs - показать все параметры");
@@ -886,8 +936,6 @@ void serialPortReading() {
       Serial.println("/help - показать справку команд");
       Serial.println("=========================");
     }
-
-    // ===== УПРАВЛЕНИЕ НАСОСОМ =====
     else if (incomingString == "/pump_on") {
       startPump();
       Serial.println("Насос ВКЛЮЧЕН");
@@ -898,8 +946,6 @@ void serialPortReading() {
       Serial.println("Насос ВЫКЛЮЧЕН");
       Serial.println("-----");
     }
-
-    // ===== УПРАВЛЕНИЕ СВЕТОМ =====
     else if (incomingString == "/light_on") {
       startLight();
       Serial.println("Свет ВКЛЮЧЕН");
@@ -910,18 +956,14 @@ void serialPortReading() {
       Serial.println("Свет ВЫКЛЮЧЕН");
       Serial.println("-----");
     }
-
-    // ===== НЕИЗВЕСТНАЯ КОМАНДА =====
     else {
       Serial.print("❌ Неизвестная команда: ");
       Serial.println(incomingString);
       Serial.println("Введите /help для списка команд");
       Serial.println("-----");
     }
-
   }
 }
-// -----------------------------
 
 void GreetingSerial() {
   Serial.println("=== ArtWat system ===");
@@ -930,9 +972,11 @@ void GreetingSerial() {
   Serial.println("=====================");
 }
 
+// ===== SETUP =====
+
 void setup() {
   Serial.begin(115200);
-
+  
   pinMode(PUMP_PIN, OUTPUT);
   pinMode(LIGHT_PIN, OUTPUT);
   digitalWrite(PUMP_PIN, HIGH);
@@ -941,34 +985,102 @@ void setup() {
   initRTC();
   loadSettings();
   
+  // ===== АППАРАТНЫЙ WATCHDOG =====
+  esp_task_wdt_deinit();
+  
+  esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = 90000,
+      .idle_core_mask = 0,
+      .trigger_panic = true
+  };
+  
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+  
+  // ===== ПРОВЕРКА WI-FI =====
   if (configMode) {
-    startConfigMode();
+    Serial.println("📡 Config Mode — AP Mode");
+    startAPMode();
   } else {
-    startNormalMode();
+    preferences.begin("bot-config", true);
+    String stored_ssid = preferences.getString("ssid", "");
+    preferences.end();
+    
+    if (stored_ssid.length() == 0) {
+      Serial.println("📡 Wi-Fi не настроен — AP Mode");
+      startAPMode();
+    } else {
+      Serial.println("📶 Wi-Fi настроен — пытаюсь подключиться");
+      tryConnectWiFi();
+      
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("📡 Не удалось подключиться — AP Mode");
+        startAPMode();
+        wifiLostTime = millis();
+      }
+    }
   }
 }
 
-void loop() {
-  serialPortReading();
+// ===== LOOP =====
 
-  if (configMode) {
+void loop() {
+  esp_task_wdt_reset();
+  
+  serialPortReading();
+  
+  if (apMode) {
     dnsServer.processNextRequest();
     server.handleClient();
-  } else {
+  }
+  
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 10000) {
+    checkSchedule();
+    lastCheck = millis();
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    if (apMode) {
+      stopAPMode();
+      Serial.println("✅ Wi-Fi есть — AP Mode отключён");
+    }
+    
+    if (!staConnected) {
+      staConnected = true;
+      wifiLostTime = 0;
+      
+      if (bot == nullptr) {
+        initBotAndMenus();
+      } else {
+        bot->begin();
+      }
+      
+      Serial.println("✅ STA Mode — бот активирован");
+    }
+    
     if (bot != nullptr) {
       bot->loop();
     }
+  } else {
+    if (staConnected) {
+      staConnected = false;
+      wifiLostTime = millis();
+      Serial.println("⚠️ Wi-Fi потерян! Переход в автономный режим.");
+    }
     
-    static unsigned long lastCheck = 0;
-    if (millis() - lastCheck > 10000) {
-      checkSchedule();
-      lastCheck = millis();
+    if (!apMode) {
+      startAPMode();
+      Serial.println("📡 AP Mode активирован");
+    }
+    
+    if (millis() - lastWifiAttempt > 300000) {
+      Serial.print("🔄 Попытка переподключения");
+      tryConnectWiFi();
     }
   }
-
-  // --- Проверка монитора порта без delay() ---
+  
   static unsigned long portOpenedTime = 0;
-
   if (!greeted) {
     if (portOpenedTime == 0) {
       portOpenedTime = millis();
@@ -978,6 +1090,6 @@ void loop() {
       greeted = true;
     }
   }
-
+  
   yield();
 }
