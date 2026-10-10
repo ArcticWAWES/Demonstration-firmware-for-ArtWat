@@ -6,7 +6,8 @@
 //                                   by Arctic_WAWES
 // 
 //  Прошивка для серии моделей ArtWat (home edition) 
-//  Firmwork version: 1.2 DEMO
+//  Firmwork version: 1.7 DEMO
+//  Microcontroller: Wemos D1 R32 (ESP32 "UNO")
 // 
 //   Особенности:
 //  - Подключение устройства происходит с помощью локальной HTML страницы, открываемой после
@@ -23,29 +24,32 @@
 //  режим где насос и лампа включаются по системному времени внезависимости от наличия интернета,
 //  но функия работает только при внесённых параметрах полива и света, если они отсуствуют -
 //  система не будет включаться.
+//  - Световая индикация в лице всторенного на плату светодиода.
 //  
 // Распиновка модулей: 
-// RTC DS1302:
+// RTC DS3231 (I2C):
 //    VCC  →  3.3V
 //    GND  →  GND
-//    CLK  →  GPIO 18
-//    DAT  →  GPIO 19
-//    RST  →  GPIO 23
+//    SDA  →  GPIO 21
+//    SCL  →  GPIO 22
 //
 //  Реле 1 (Насос):
 //    VCC  →  5V
 //    GND  →  GND
-//    IN   →  GPIO 4
+//    IN   →  GPIO 4    (АКТИВНОЕ НИЗКИМ: LOW = вкл, HIGH = выкл)
 //
 //  Реле 2 (Лампа):
 //    VCC  →  5V
 //    GND  →  GND
-//    IN   →  GPIO 5
+//    IN   →  GPIO 5    (АКТИВНОЕ НИЗКИМ: LOW = вкл, HIGH = выкл)
+//
+//  Светодиод индикации:
+//    Встроенный на Wemos D1 R32 → GPIO 2
 //
 
 #include <VKassistent.h>
-#include <ThreeWire.h>
-#include <RtcDS1302.h>
+#include <Wire.h>
+#include <RTClib.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -56,15 +60,23 @@ const char* AP_SSID = "ArtWAT_system";
 const char* AP_PASSWORD = "3468#2550";
 const String SERIAL_PASSWORD = "3468#2550";
 
-const int IO_PIN = 19;
-const int SCLK_PIN = 18;
-const int CE_PIN = 23;
+// I2C пины для DS3231
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
 
-ThreeWire myWire(IO_PIN, SCLK_PIN, CE_PIN);
-RtcDS1302<ThreeWire> Rtc(myWire);
+RTC_DS3231 rtc;
+bool rtcReady = false;
 
 const int PUMP_PIN = 4;
 const int LIGHT_PIN = 5;
+
+// ===== СВЕТОДИОД ИНДИКАЦИИ =====
+const int STATUS_LED_PIN = 2;   // встроенный светодиод
+
+// ===== ТИП РЕЛЕ =====
+// true  — реле активные НИЗКИМ (LOW = вкл)
+// false — реле активные ВЫСОКИМ (HIGH = вкл)
+#define RELAY_ACTIVE_LOW true
 
 WebServer server(80);
 DNSServer dnsServer;
@@ -81,9 +93,14 @@ unsigned long wifiLostTime = 0;
 
 VKassistent* bot = nullptr;
 
+// ===== СЛОТЫ ВРЕМЕНИ ПОЛИВА =====
+#define WATER_SLOTS 3
+String waterSlots[WATER_SLOTS] = {"", "", ""};
+int activeWaterSlot = -1;
+unsigned long lastWaterTriggerMs = 0;
+
 // ===== ПАРАМЕТРЫ СИСТЕМЫ =====
 String current_keyboard = "MainMenu";
-String waterTime = "09:00";
 String lightTime = "18:00";
 int light_duration_value = 0;
 int water_duration_value = 0;
@@ -107,6 +124,8 @@ String WateringMenu;
 String LightingMenu;
 String WaterDurationMenu;
 String LightDurationMenu;
+String WateringTimeMenu;
+String TimeEditMenu;
 
 // ===== FORWARD DECLARATIONS =====
 void initBotAndMenus();
@@ -117,77 +136,207 @@ void serialPortReading();
 void GreetingSerial();
 void deleteSystemData();
 
+// ===== СВЕТОДИОДНАЯ ИНДИКАЦИЯ =====
+bool systemError = false;
+bool fastBlinkActive = false;
+int  fastBlinksLeft = 0;
+unsigned long lastBlink = 0;
+bool ledState = false;
+
 // ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
 String getCurrentTime() {
-  if (!Rtc.IsDateTimeValid()) return "00:00";
-  RtcDateTime now = Rtc.GetDateTime();
+  if (!rtcReady) return "00:00";
+  DateTime now = rtc.now();
   char buf[16];
-  sprintf(buf, "%02d:%02d", now.Hour(), now.Minute());
+  sprintf(buf, "%02d:%02d", now.hour(), now.minute());
   return String(buf);
 }
 
 String getCurrentDateTime() {
-  if (!Rtc.IsDateTimeValid()) return "Ошибка RTC";
-  RtcDateTime now = Rtc.GetDateTime();
+  if (!rtcReady) return "Ошибка RTC";
+  DateTime now = rtc.now();
   char buf[32];
   sprintf(buf, "%02d.%02d.%04d %02d:%02d:%02d",
-    now.Day(), now.Month(), now.Year(),
-    now.Hour(), now.Minute(), now.Second());
+    now.day(), now.month(), now.year(),
+    now.hour(), now.minute(), now.second());
   return String(buf);
 }
 
 void initRTC() {
-  Rtc.Begin();
-  Rtc.SetIsWriteProtected(false);
-  if (!Rtc.GetIsRunning()) Rtc.SetIsRunning(true);
-  
-  if (!Rtc.IsDateTimeValid()) {
-    RtcDateTime compiled = RtcDateTime(__DATE__, __TIME__);
-    Rtc.SetDateTime(compiled);
+  Serial.println("🔧 initRTC: Wire.begin...");
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(500);
+
+  Serial.println("🔧 initRTC: проверяю адрес 0x68...");
+  Wire.beginTransmission(0x68);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("❌ DS3231 не отвечает по адресу 0x68");
+    rtcReady = false;
+    return;
   }
+  Serial.println("✅ DS3231 отвечает на I2C");
+
+  if (!rtc.begin()) {
+    Serial.println("❌ RTClib не смог инициализировать DS3231");
+    rtcReady = false;
+    return;
+  }
+  Serial.println("✅ RTClib инициализирован");
+
+  rtcReady = true;
+
+  if (rtc.lostPower()) {
+    Serial.println("⚠️ RTC потерял питание — ставлю время сборки");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  Serial.print("📅 Время RTC: ");
+  Serial.println(getCurrentDateTime());
 }
 
 bool setRtcTime(int year, int month, int day, int hour, int minute) {
+  if (!rtcReady) return false;
+
   if (year < 2000 || year > 2099) return false;
   if (month < 1 || month > 12) return false;
   if (day < 1 || day > 31) return false;
   if (hour < 0 || hour > 23) return false;
   if (minute < 0 || minute > 59) return false;
-  
-  RtcDateTime newTime(year, month, day, hour, minute, 0);
-  Rtc.SetDateTime(newTime);
+
+  rtc.adjust(DateTime(year, month, day, hour, minute, 0));
   return true;
 }
 
-void startLight() {
-  digitalWrite(LIGHT_PIN, HIGH);
+// ===== УВЕДОМЛЕНИЯ В VK =====
+void notifyUser(String message) {
+  if (bot == nullptr) return;
+
+  preferences.begin("bot-config", true);
+  long lastPeer = preferences.getLong("last_peer", 0);
+  preferences.end();
+
+  if (lastPeer == 0) {
+    Serial.println("⚠️ Некуда уведомлять — пользователь не писал боту");
+    return;
+  }
+
+  Serial.println("📢 Уведомление: " + message);
+  bot->send(lastPeer, message);
+}
+
+// ===== СВЕТОДИОДНАЯ ИНДИКАЦИЯ =====
+
+void triggerSuccessBlink() {
+  fastBlinkActive = true;
+  fastBlinksLeft = 10;
+  lastBlink = millis();
+  Serial.println("💡 LED: сигнал успешной инициализации");
+}
+
+void updateStatusLED() {
+  if (fastBlinkActive) {
+    if (millis() - lastBlink >= 100) {
+      lastBlink = millis();
+      ledState = !ledState;
+      digitalWrite(STATUS_LED_PIN, ledState);
+      if (!ledState) fastBlinksLeft--;
+      if (fastBlinksLeft <= 0) {
+        fastBlinkActive = false;
+        digitalWrite(STATUS_LED_PIN, LOW);
+      }
+    }
+    return;
+  }
+
+  if (systemError) {
+    if (millis() - lastBlink >= 500) {
+      lastBlink = millis();
+      ledState = !ledState;
+      digitalWrite(STATUS_LED_PIN, ledState);
+    }
+    return;
+  }
+
+  if (apMode) {
+    if (!ledState) {
+      digitalWrite(STATUS_LED_PIN, HIGH);
+      ledState = true;
+    }
+    return;
+  }
+
+  if (ledState) {
+    digitalWrite(STATUS_LED_PIN, LOW);
+    ledState = false;
+  }
+}
+
+// ===== УПРАВЛЕНИЕ РЕЛЕ =====
+
+void startLight(bool silent = false) {
+  #if RELAY_ACTIVE_LOW
+    digitalWrite(LIGHT_PIN, LOW);
+  #else
+    digitalWrite(LIGHT_PIN, HIGH);
+  #endif
   lightState = true;
   lightStartTime = millis();
+
+  if (!silent) {
+    notifyUser("💡 Свет включён!\n📅 " + getCurrentDateTime());
+  }
 }
 
-void stopLight() {
-  digitalWrite(LIGHT_PIN, LOW);
+void stopLight(bool silent = false) {
+  #if RELAY_ACTIVE_LOW
+    digitalWrite(LIGHT_PIN, HIGH);
+  #else
+    digitalWrite(LIGHT_PIN, LOW);
+  #endif
   lightState = false;
   lightStartTime = 0;
+
+  if (!silent) {
+    notifyUser("✅💡 Свет выключен!\n📅 " + getCurrentDateTime());
+  }
 }
 
-void startPump() {
-  digitalWrite(PUMP_PIN, HIGH);
+void startPump(bool silent = false) {
+  #if RELAY_ACTIVE_LOW
+    digitalWrite(PUMP_PIN, LOW);
+  #else
+    digitalWrite(PUMP_PIN, HIGH);
+  #endif
   pumpState = true;
   pumpStartTime = millis();
+
+  if (!silent) {
+    notifyUser("💧 Полив начат!\n📅 " + getCurrentDateTime());
+  }
 }
 
-void stopPump() {
-  digitalWrite(PUMP_PIN, LOW);
+void stopPump(bool silent = false) {
+  #if RELAY_ACTIVE_LOW
+    digitalWrite(PUMP_PIN, HIGH);
+  #else
+    digitalWrite(PUMP_PIN, LOW);
+  #endif
   pumpState = false;
   pumpStartTime = 0;
+
+  if (!silent) {
+    notifyUser("✅💧 Полив завершён!\n📅 " + getCurrentDateTime());
+  }
 }
 
 void checkSchedule() {
-  if (!Rtc.IsDateTimeValid()) return;
+  if (!rtcReady) return;
+
   String currentTime = getCurrentTime();
-  
+
+  // --- СВЕТ (одно время) ---
   if (light_duration_value > 0) {
     if (currentTime == lightTime && !lightState) startLight();
     if (lightState && lightStartTime > 0) {
@@ -195,28 +344,92 @@ void checkSchedule() {
       if (elapsed >= (unsigned long)light_duration_value * 1000) stopLight();
     }
   }
-  
-  if (water_duration_value > 0) {
-    if (currentTime == waterTime && !pumpState) startPump();
-    if (pumpState && pumpStartTime > 0) {
-      unsigned long elapsed = millis() - pumpStartTime;
-      if (elapsed >= (unsigned long)water_duration_value) stopPump();
+
+  // --- ПОЛИВ (по слотам) ---
+  if (water_duration_value > 0 && !pumpState) {
+    for (int i = 0; i < WATER_SLOTS; i++) {
+      if (waterSlots[i].length() > 0 &&
+          waterSlots[i] == currentTime &&
+          millis() - lastWaterTriggerMs > 60000) {
+        startPump();
+        lastWaterTriggerMs = millis();
+        break;
+      }
     }
+  }
+  if (pumpState && pumpStartTime > 0) {
+    unsigned long elapsed = millis() - pumpStartTime;
+    if (elapsed >= (unsigned long)water_duration_value) stopPump();
   }
 }
 
 String getSystemStatus() {
   String status = "📊 СТАТУС СИСТЕМЫ\n\n";
+
   status += "💧 ПОЛИВ:\n";
-  status += "   • Время: " + waterTime + "\n";
+  status += "   • Времена: ";
+  bool anyWaterSlot = false;
+  for (int i = 0; i < WATER_SLOTS; i++) {
+    if (waterSlots[i].length() > 0) {
+      if (anyWaterSlot) status += ", ";
+      status += waterSlots[i];
+      anyWaterSlot = true;
+    }
+  }
+  if (!anyWaterSlot) status += "не заданы";
+  status += "\n";
   status += "   • Длительность: " + String(water_duration_value / 60000) + " мин\n";
-  status += "   • Статус: " + String(pumpState ? "РАБОТАЕТ" : "ОСТАНОВЛЕН") + "\n\n";
+  status += "   • Статус: " + String(pumpState ? "НАСОС ВКЛЮЧЕН" : "НАСОС ВЫКЛЮЧЕН") + "\n\n";
+
   status += "💡 СВЕТ:\n";
   status += "   • Время включения: " + lightTime + "\n";
   status += "   • Длительность: " + String(light_duration_value / 3600) + " ч\n";
   status += "   • Статус: " + String(lightState ? "ВКЛЮЧЕН" : "ВЫКЛЮЧЕН") + "\n\n";
+
   status += "📅 Время системы: " + getCurrentDateTime();
   return status;
+}
+
+// ===== СЛОТЫ ВРЕМЕНИ ПОЛИВА =====
+
+String buildWaterSlotsText() {
+  String s = "⏰ ВРЕМЕНА ПОЛИВА:\n\n";
+  for (int i = 0; i < WATER_SLOTS; i++) {
+    s += String(i + 1) + ". ";
+    s += (waterSlots[i].length() == 0 ? "полив отсутствует" : waterSlots[i]);
+    s += "\n";
+  }
+  s += "\nВыберите слот для редактирования.";
+  return s;
+}
+
+void saveWaterSlots() {
+  String packed = "";
+  for (int i = 0; i < WATER_SLOTS; i++) {
+    if (i > 0) packed += ",";
+    packed += waterSlots[i];
+  }
+  preferences.begin("bot-config", false);
+  preferences.putString("water_slots", packed);
+  preferences.end();
+}
+
+void loadWaterSlots() {
+  preferences.begin("bot-config", true);
+  String packed = preferences.getString("water_slots", "");
+  preferences.end();
+
+  for (int i = 0; i < WATER_SLOTS; i++) waterSlots[i] = "";
+
+  if (packed.length() == 0) return;
+
+  int start = 0, idx = 0;
+  while (start <= packed.length() && idx < WATER_SLOTS) {
+    int comma = packed.indexOf(',', start);
+    if (comma < 0) comma = packed.length();
+    waterSlots[idx++] = packed.substring(start, comma);
+    start = comma + 1;
+  }
 }
 
 // ===== HTML СТРАНИЦА =====
@@ -227,44 +440,25 @@ void handleRoot() {
   String s_pass = preferences.getString("password", "");
   String s_token = preferences.getString("token", "");
   String s_group = preferences.getString("group_id", "");
-  int savedAdminCount = preferences.getInt("admin_count", 0);
-  
-  String adminInputs = "";
-  if (savedAdminCount == 0) {
-    adminInputs = "<div><input type=\"number\" name=\"admin_0\" placeholder=\"ID админа\" style=\"width: 70%; padding: 8px; box-sizing: border-box; margin-bottom: 5px;\"></div>";
-  } else {
-    for (int i = 0; i < savedAdminCount; i++) {
-      String aVal = preferences.getString(("admin_" + String(i)).c_str(), "");
-      adminInputs += "<div style=\"margin-bottom: 5px;\"><input type=\"number\" name=\"admin_" + String(i) + "\" value=\"" + aVal + "\" style=\"width: 70%; padding: 8px; box-sizing: border-box;\">";
-      if (i > 0) {
-        adminInputs += " <button type=\"button\" onclick=\"this.parentElement.remove()\" style=\"padding: 8px;\">✕</button>";
-      }
-      adminInputs += "</div>";
-    }
-  }
   preferences.end();
 
   String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>VKassistent</title></head>";
   html += "<body style=\"font-family: Arial; max-width: 400px; margin: 20px auto; background: #f0f2f5; padding: 20px;\">";
   html += "<h2 style=\"text-align: center;\">Системные настройки ArtWAT</h2>";
   html += "<form action=\"/save\" method=\"POST\" style=\"background: white; padding: 20px; border-radius: 10px;\">";
-  
+
   html += "<label><b>Wi-Fi имя</b></label>";
   html += "<input type=\"text\" name=\"ssid\" value=\"" + s_ssid + "\" required style=\"width: 100%; padding: 8px; margin: 6px 0 10px; box-sizing: border-box;\">";
-  
+
   html += "<label><b>Пароль Wi-Fi</b></label>";
   html += "<input type=\"password\" name=\"password\" value=\"" + s_pass + "\" style=\"width: 100%; padding: 8px; margin: 6px 0 10px; box-sizing: border-box;\">";
-  
+
   html += "<label><b>Токен VK</b></label>";
   html += "<input type=\"text\" name=\"token\" value=\"" + s_token + "\" required style=\"width: 100%; padding: 8px; margin: 6px 0 10px; box-sizing: border-box;\">";
-  
+
   html += "<label><b>ID группы</b></label>";
   html += "<input type=\"text\" name=\"group_id\" value=\"" + s_group + "\" required style=\"width: 100%; padding: 8px; margin: 6px 0 10px; box-sizing: border-box;\">";
-  
-  html += "<label><b>Админы</b></label>";
-  html += "<div id=\"admins\">" + adminInputs + "</div>";
-  html += "<button type=\"button\" onclick=\"addAdmin()\" style=\"padding: 6px 12px; margin: 6px 0;\">➕ Добавить</button><hr>";
-  
+
   html += "<label><b>Установить время</b></label>";
   html += "<div style=\"display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px;\">";
   html += "<input type=\"number\" name=\"day\" placeholder=\"День\" min=\"1\" max=\"31\" style=\"width: 28%; padding: 8px; box-sizing: border-box;\">";
@@ -273,15 +467,11 @@ void handleRoot() {
   html += "<input type=\"number\" name=\"hour\" placeholder=\"Час\" min=\"0\" max=\"23\" style=\"width: 47%; padding: 8px; box-sizing: border-box;\">";
   html += "<input type=\"number\" name=\"minute\" placeholder=\"Мин\" min=\"0\" max=\"59\" style=\"width: 47%; padding: 8px; box-sizing: border-box;\">";
   html += "</div>";
-  
+
   html += "<input type=\"submit\" value=\"Сохранить\" style=\"width: 100%; padding: 10px; background: #4c75a3; color: white; border: none; font-weight: bold; border-radius: 6px; cursor: pointer;\">";
   html += "</form>";
-  
-  html += "<script>let adminCount = " + String(savedAdminCount > 0 ? savedAdminCount : 1) + ";";
-  html += "function addAdmin() { const container = document.getElementById('admins'); const div = document.createElement('div'); div.style.marginBottom = '5px';";
-  html += "div.innerHTML = `<input type=\"number\" name=\"admin_${adminCount}\" placeholder=\"ID админа\" style=\"width: 70%; padding: 8px; box-sizing: border-box;\"> <button type=\"button\" onclick=\"this.parentElement.remove()\" style=\"padding: 8px;\">✕</button>`;";
-  html += "container.appendChild(div); adminCount++; }</script></body></html>";
-  
+  html += "</body></html>";
+
   server.send(200, "text/html", html);
 }
 
@@ -289,46 +479,36 @@ void loadSettings() {
   preferences.begin("bot-config", true);
   String stored_ssid = preferences.getString("ssid", "");
   bool goto_config = preferences.getBool("goto_config", false);
-  
+
   if (stored_ssid.length() == 0 || goto_config) {
     configMode = true;
   }
-  
-  waterTime = preferences.getString("water_time", "09:00");
+
   lightTime = preferences.getString("light_time", "18:00");
   water_duration_value = preferences.getInt("water_duration", 0);
   light_duration_value = preferences.getInt("light_duration", 0);
-  
+
   preferences.end();
+
+  loadWaterSlots();
 }
 
 void handleSave() {
   if (server.hasArg("ssid") && server.hasArg("token") && server.hasArg("group_id")) {
     preferences.begin("bot-config", false);
-    
+
     preferences.putString("ssid", server.arg("ssid"));
     preferences.putString("password", server.arg("password"));
     preferences.putString("token", server.arg("token"));
     preferences.putString("group_id", server.arg("group_id"));
     preferences.putBool("goto_config", false);
-    
-    preferences.putString("water_time", waterTime);
+
     preferences.putString("light_time", lightTime);
     preferences.putInt("water_duration", water_duration_value);
     preferences.putInt("light_duration", light_duration_value);
-    
-    int adminCount = 0;
-    for (int i = 0; i < 10; i++) {
-      String key = "admin_" + String(i);
-      if (server.hasArg(key) && server.arg(key) != "") {
-        String pKey = "admin_" + String(adminCount);
-        preferences.putString(pKey.c_str(), server.arg(key));
-        adminCount++;
-      }
-    }
-    preferences.putInt("admin_count", adminCount);
+
     preferences.end();
-    
+
     if (server.hasArg("year") && server.arg("year") != "") {
       setRtcTime(
         server.arg("year").toInt(),
@@ -338,7 +518,7 @@ void handleSave() {
         server.arg("minute").toInt()
       );
     }
-    
+
     server.send(200, "text/html; charset=UTF-8", 
       "<h2>✅ Настройки сохранены успешно!</h2>"
       "<p>🔄 Плата перезагружается для подключения...</p>"
@@ -354,39 +534,43 @@ void handleSave() {
 
 void startAPMode() {
   if (apMode) return;
-  
+
   Serial.println("📡 Поднимаю точку доступа ArtWAT_system");
-  
+
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASSWORD);
-  
+
   dnsServer.start(DNS_PORT, "*", apIP);
-  
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.onNotFound([]() {
     server.sendHeader("Location", String("http://") + apIP.toString(), true);
     server.send(302, "text/plain", "");
   });
-  
+
   server.begin();
   apMode = true;
-  
+  systemError = false;
+
   Serial.print("📡 IP точки доступа: ");
   Serial.println(WiFi.softAPIP());
 }
 
 void stopAPMode() {
   if (!apMode) return;
-  
+
   Serial.println("📡 Отключаю точку доступа");
-  
+
   server.stop();
   dnsServer.stop();
   WiFi.softAPdisconnect(true);
-  
+
   apMode = false;
+
+  digitalWrite(STATUS_LED_PIN, LOW);
+  ledState = false;
 }
 
 // ===== СБРОС ДАННЫХ =====
@@ -401,324 +585,469 @@ void deleteSystemData() {
   ESP.restart();
 }
 
+// ===== ОТКРЫТИЕ СЛОТА ПОЛИВА =====
+
+void openTimeSlot(VKMessage& msg, int slot) {
+  activeWaterSlot = slot;
+  waitingForWaterTime = true;
+  waitingUserId = msg.fromId;
+  current_keyboard = "TimeEditMenu";
+
+  String text = "⏰ ВРЕМЕННОЙ СЛОТ №" + String(slot + 1) + "\n\n";
+  if (waterSlots[slot].length() == 0) {
+    text += "Время не задано.\n";
+  } else {
+    text += "Текущее время: " + waterSlots[slot] + "\n";
+  }
+  text += "\nНапишите новое время в формате ЧЧ:ММ.\n\n";
+  text += "Или нажмите «УБРАТЬ ПОЛИВ❌» чтобы насос не включался в данное время.";
+
+  bot->sendWithKeyboard(msg.peerId, text, TimeEditMenu);
+}
+
 // ===== ИНИЦИАЛИЗАЦИЯ VK-БОТА И МЕНЮ =====
 
 void initBotAndMenus() {
   MainMenu = createKeyboard(
     Button("СТАТУС📊", secondary),
+    Line(),
     Button("НАСТРОЙКИ⚙️", secondary),
+    Line(),
     Button("СИСТЕМНЫЕ НАСТРОЙКИ🔃", primary)
   );
 
   SettingsMenu = createKeyboard(
     Button("ПОЛИВ💧", secondary),
+    Line(),
     Button("СВЕТ💡", secondary),
+    Line(),
     Button("НАЗАД↩️", primary)
   );
 
   WateringMenu = createKeyboard(
     Button("ДЛИТЕЛЬНОСТЬ💧⏱", secondary),
+    Line(),
     Button("ВРЕМЯ ПОЛИВА💧🕐", secondary),
+    Line(),
     Button("НАЗАД↩️", primary)
   );
 
   LightingMenu = createKeyboard(
     Button("ДЛИТЕЛЬНОСТЬ💡⏱", secondary),
+    Line(),
     Button("ВРЕМЯ ВКЛЮЧЕНИЯ💡🕐", secondary),
+    Line(),
     Button("ВКЛЮЧИТЬ💡", positive),
     Button("ВЫКЛЮЧИТЬ💡", negative),
+    Line(),
     Button("НАЗАД↩️", primary)
   );
 
   WaterDurationMenu = createKeyboard(
     Button("1 минуту", secondary),
+    Line(),
     Button("2 минуты", secondary),
+    Line(),
     Button("3 минуты", secondary),
+    Line(),
     Button("5 минут", secondary),
+    Line(),
     Button("10 минут", secondary),
+    Line(),
     Button("НАЗАД↩️", primary)
   );
 
   LightDurationMenu = createKeyboard(
     Button("2 часа", secondary),
+    Line(),
     Button("4 часа", secondary),
+    Line(),
     Button("6 часов", secondary),
+    Line(),
     Button("8 часов", secondary),
+    Line(),
     Button("12 часов", secondary),
+    Line(),
     Button("НАЗАД↩️", primary)
   );
 
-  for (int i = 0; i < 24; i++) {
-    char buf[16];
-    sprintf(buf, "%02d:00", i);
-    String timeStr = String(buf);
-    
-    bot->proccesMessage(timeStr, [timeStr](long UserID, String text) {
-      if (waitingForWaterTime && UserID == waitingUserId) {
-        waitingForWaterTime = false;
-        waterTime = timeStr;
-        preferences.begin("bot-config", false);
-        preferences.putString("water_time", waterTime);
-        preferences.end();
-        current_keyboard = "WateringMenu";
-        bot->sendWithKeyboard(UserID, "✅ Время полива установлено: " + waterTime, WateringMenu);
-        return;
-      }
-      if (waitingForLightTime && UserID == waitingLightUserId) {
-        waitingForLightTime = false;
-        lightTime = timeStr;
-        preferences.begin("bot-config", false);
-        preferences.putString("light_time", lightTime);
-        preferences.end();
-        current_keyboard = "LightingMenu";
-        bot->sendWithKeyboard(UserID, "✅ Время включения света установлено: " + lightTime, LightingMenu);
-        return;
-      }
-    });
-  }
+  WateringTimeMenu = createKeyboard(
+    Button("1 ВРЕМЯ", secondary),
+    Button("2 ВРЕМЯ", secondary),
+    Button("3 ВРЕМЯ", secondary),
+    Line(),
+    Button("ОЧИСТИТЬ ВСЕ🗑", negative),
+    Line(),
+    Button("НАЗАД↩️", primary)
+  );
 
-  bot->proccesMessage("НАСТРОЙКИ⚙️", [](long UserID, String text) {
+  TimeEditMenu = createKeyboard(
+    Button("УБРАТЬ ПОЛИВ❌", negative),
+    Line(),
+    Button("НАЗАД↩️", primary)
+  );
+
+  // ===== ОСНОВНЫЕ КОМАНДЫ =====
+
+  bot->onMessage("СТАТУС📊", [](VKMessage& msg) {
+    preferences.begin("bot-config", false);
+    preferences.putLong("last_peer", msg.peerId);
+    preferences.end();
+
+    bot->send(msg.peerId, getSystemStatus());
+  });
+
+  bot->onMessage("НАСТРОЙКИ⚙️", [](VKMessage& msg) {
     current_keyboard = "SettingsMenu";
-    bot->sendWithKeyboard(UserID, "НАСТРОЙКИ⚙️\n\nВыберите раздел для редактирования параметров.", SettingsMenu);
+    bot->sendWithKeyboard(msg.peerId, "НАСТРОЙКИ⚙️\n\nВыберите раздел для редактирования параметров.", SettingsMenu);
   });
 
-  bot->proccesMessage("СТАТУС📊", [](long UserID, String text) {
-    bot->send(UserID, getSystemStatus());
-  });
-
-  bot->proccesMessage("ПОЛИВ💧", [](long UserID, String text) {
+  bot->onMessage("ПОЛИВ💧", [](VKMessage& msg) {
     if (current_keyboard == "SettingsMenu") {
       current_keyboard = "WateringMenu";
-      bot->sendWithKeyboard(UserID, "ПОЛИВ💧\n\nРаздел для редактирования параметров полива", WateringMenu);
+      bot->sendWithKeyboard(msg.peerId, "ПОЛИВ💧\n\nРаздел для редактирования параметров полива", WateringMenu);
     }
   });
 
-  bot->proccesMessage("ДЛИТЕЛЬНОСТЬ💧⏱", [](long UserID, String text) {
+  bot->onMessage("ДЛИТЕЛЬНОСТЬ💧⏱", [](VKMessage& msg) {
     if (current_keyboard == "WateringMenu") {
       current_keyboard = "WaterDurationMenu";
-      bot->sendWithKeyboard(UserID, "⏱ ВЫБЕРИТЕ ДЛИТЕЛЬНОСТЬ ПОЛИВА", WaterDurationMenu);
+      bot->sendWithKeyboard(msg.peerId, "⏱ ВЫБЕРИТЕ ДЛИТЕЛЬНОСТЬ ПОЛИВА", WaterDurationMenu);
     }
   });
 
-  bot->proccesMessage("ВРЕМЯ ПОЛИВА💧🕐", [](long UserID, String text) {
+  bot->onMessage("ВРЕМЯ ПОЛИВА💧🕐", [](VKMessage& msg) {
     if (current_keyboard == "WateringMenu") {
-      waitingForWaterTime = true;
-      waitingUserId = UserID;
-      
-      String message = "⏰ ВВЕДИТЕ ВРЕМЯ ПОЛИВА\n\n";
-      message += "Напишите время в формате ЧЧ:00\n";
-      message += "Например: 14:00, 09:00, 18:00\n\n";
-      message += "Доступные часы:\n";
-      message += "00:00  01:00  02:00  03:00\n";
-      message += "04:00  05:00  06:00  07:00\n";
-      message += "08:00  09:00  10:00  11:00\n";
-      message += "12:00  13:00  14:00  15:00\n";
-      message += "16:00  17:00  18:00  19:00\n";
-      message += "20:00  21:00  22:00  23:00\n\n";
-      message += "Текущее время полива: " + waterTime;
-      
-      bot->send(UserID, message);
+      current_keyboard = "WateringTimeMenu";
+      bot->sendWithKeyboard(msg.peerId, buildWaterSlotsText(), WateringTimeMenu);
     }
   });
 
-  bot->proccesMessage("СВЕТ💡", [](long UserID, String text) {
+  bot->onMessage("1 ВРЕМЯ", [](VKMessage& msg) {
+    if (current_keyboard == "WateringTimeMenu") openTimeSlot(msg, 0);
+  });
+
+  bot->onMessage("2 ВРЕМЯ", [](VKMessage& msg) {
+    if (current_keyboard == "WateringTimeMenu") openTimeSlot(msg, 1);
+  });
+
+  bot->onMessage("3 ВРЕМЯ", [](VKMessage& msg) {
+    if (current_keyboard == "WateringTimeMenu") openTimeSlot(msg, 2);
+  });
+
+  bot->onMessage("ОЧИСТИТЬ ВСЕ🗑", [](VKMessage& msg) {
+    if (current_keyboard == "WateringTimeMenu") {
+      for (int i = 0; i < WATER_SLOTS; i++) waterSlots[i] = "";
+      saveWaterSlots();
+      bot->sendWithKeyboard(msg.peerId,
+        "✅ Все времена очищены!\n\n" + buildWaterSlotsText(), WateringTimeMenu);
+    }
+  });
+
+  bot->onMessage("УБРАТЬ ПОЛИВ❌", [](VKMessage& msg) {
+    if (current_keyboard == "TimeEditMenu" && activeWaterSlot >= 0) {
+      int slot = activeWaterSlot;
+      waterSlots[slot] = "";
+      saveWaterSlots();
+
+      waitingForWaterTime = false;
+      waitingUserId = 0;
+      activeWaterSlot = -1;
+
+      current_keyboard = "WateringTimeMenu";
+      bot->sendWithKeyboard(msg.peerId,
+        "✅ Слот очищен!\n\n" + buildWaterSlotsText(),
+        WateringTimeMenu);
+    }
+  });
+
+  bot->onMessage("СВЕТ💡", [](VKMessage& msg) {
     if (current_keyboard == "SettingsMenu") {
       current_keyboard = "LightingMenu";
-      bot->sendWithKeyboard(UserID, "СВЕТ💡\n\nРаздел редактирования параметров лампы.", LightingMenu);
+      bot->sendWithKeyboard(msg.peerId, "СВЕТ💡\n\nРаздел редактирования параметров лампы.", LightingMenu);
     }
   });
 
-  bot->proccesMessage("ДЛИТЕЛЬНОСТЬ💡⏱", [](long UserID, String text) {
+  bot->onMessage("ДЛИТЕЛЬНОСТЬ💡⏱", [](VKMessage& msg) {
     if (current_keyboard == "LightingMenu") {
       current_keyboard = "LightDurationMenu";
-      bot->sendWithKeyboard(UserID, "⏱ ВЫБЕРИТЕ ДЛИТЕЛЬНОСТЬ РАБОТЫ ЛАМПЫ", LightDurationMenu);
+      bot->sendWithKeyboard(msg.peerId, "⏱ ВЫБЕРИТЕ ДЛИТЕЛЬНОСТЬ РАБОТЫ ЛАМПЫ", LightDurationMenu);
     }
   });
 
-  bot->proccesMessage("ВРЕМЯ ВКЛЮЧЕНИЯ💡🕐", [](long UserID, String text) {
+  bot->onMessage("ВРЕМЯ ВКЛЮЧЕНИЯ💡🕐", [](VKMessage& msg) {
     if (current_keyboard == "LightingMenu") {
       waitingForLightTime = true;
-      waitingLightUserId = UserID;
-      
+      waitingLightUserId = msg.fromId;
+
       String message = "⏰ ВВЕДИТЕ ВРЕМЯ ВКЛЮЧЕНИЯ СВЕТА\n\n";
-      message += "Напишите время в формате ЧЧ:00\n";
-      message += "Например: 14:00, 09:00, 18:00\n\n";
-      message += "Доступные часы:\n";
-      message += "00:00  01:00  02:00  03:00\n";
-      message += "04:00  05:00  06:00  07:00\n";
-      message += "08:00  09:00  10:00  11:00\n";
-      message += "12:00  13:00  14:00  15:00\n";
-      message += "16:00  17:00  18:00  19:00\n";
-      message += "20:00  21:00  22:00  23:00\n\n";
+      message += "Напишите время в формате ЧЧ:ММ\n\n";
       message += "Текущее время включения: " + lightTime;
-      
-      bot->send(UserID, message);
+
+      bot->send(msg.peerId, message);
     }
   });
 
-  bot->proccesMessage("ВКЛЮЧИТЬ💡", [](long UserID, String text) {
+  bot->onMessage("ВКЛЮЧИТЬ💡", [](VKMessage& msg) {
     if (current_keyboard == "LightingMenu") {
       if (!lightState) {
-        startLight();
-        bot->send(UserID, "💡 Свет включён вручную");
+        startLight(true);
+        bot->send(msg.peerId, "💡 Свет включён вручную");
       } else {
-        bot->send(UserID, "💡 Свет уже включён");
+        bot->send(msg.peerId, "💡 Свет уже включён");
       }
     }
   });
 
-  bot->proccesMessage("ВЫКЛЮЧИТЬ💡", [](long UserID, String text) {
+  bot->onMessage("ВЫКЛЮЧИТЬ💡", [](VKMessage& msg) {
     if (current_keyboard == "LightingMenu") {
       if (lightState) {
-        stopLight();
-        bot->send(UserID, "💡 Свет выключен вручную");
+        stopLight(true);
+        bot->send(msg.peerId, "💡 Свет выключен вручную");
       } else {
-        bot->send(UserID, "💡 Свет уже выключен");
+        bot->send(msg.peerId, "💡 Свет уже выключен");
       }
     }
   });
 
-  bot->proccesMessage("1 минуту", [](long UserID, String text) {
+  bot->onMessage("1 минуту", [](VKMessage& msg) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 60000;
       preferences.begin("bot-config", false);
       preferences.putInt("water_duration", water_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность полива: 1 минута", WateringMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность полива: 1 минута", WateringMenu);
       current_keyboard = "WateringMenu";
     }
   });
 
-  bot->proccesMessage("2 минуты", [](long UserID, String text) {
+  bot->onMessage("2 минуты", [](VKMessage& msg) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 120000;
       preferences.begin("bot-config", false);
       preferences.putInt("water_duration", water_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность полива: 2 минуты", WateringMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность полива: 2 минуты", WateringMenu);
       current_keyboard = "WateringMenu";
     }
   });
 
-  bot->proccesMessage("3 минуты", [](long UserID, String text) {
+  bot->onMessage("3 минуты", [](VKMessage& msg) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 180000;
       preferences.begin("bot-config", false);
       preferences.putInt("water_duration", water_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность полива: 3 минуты", WateringMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность полива: 3 минуты", WateringMenu);
       current_keyboard = "WateringMenu";
     }
   });
 
-  bot->proccesMessage("5 минут", [](long UserID, String text) {
+  bot->onMessage("5 минут", [](VKMessage& msg) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 300000;
       preferences.begin("bot-config", false);
       preferences.putInt("water_duration", water_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность полива: 5 минут", WateringMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность полива: 5 минут", WateringMenu);
       current_keyboard = "WateringMenu";
     }
   });
 
-  bot->proccesMessage("10 минут", [](long UserID, String text) {
+  bot->onMessage("10 минут", [](VKMessage& msg) {
     if (current_keyboard == "WaterDurationMenu") {
       water_duration_value = 600000;
       preferences.begin("bot-config", false);
       preferences.putInt("water_duration", water_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность полива: 10 минут", WateringMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность полива: 10 минут", WateringMenu);
       current_keyboard = "WateringMenu";
     }
   });
 
-  bot->proccesMessage("2 часа", [](long UserID, String text) {
+  bot->onMessage("2 часа", [](VKMessage& msg) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 7200;
       preferences.begin("bot-config", false);
       preferences.putInt("light_duration", light_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность света: 2 часа", LightingMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность света: 2 часа", LightingMenu);
       current_keyboard = "LightingMenu";
     }
   });
 
-  bot->proccesMessage("4 часа", [](long UserID, String text) {
+  bot->onMessage("4 часа", [](VKMessage& msg) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 14400;
       preferences.begin("bot-config", false);
       preferences.putInt("light_duration", light_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность света: 4 часа", LightingMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность света: 4 часа", LightingMenu);
       current_keyboard = "LightingMenu";
     }
   });
 
-  bot->proccesMessage("6 часов", [](long UserID, String text) {
+  bot->onMessage("6 часов", [](VKMessage& msg) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 21600;
       preferences.begin("bot-config", false);
       preferences.putInt("light_duration", light_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность света: 6 часов", LightingMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность света: 6 часов", LightingMenu);
       current_keyboard = "LightingMenu";
     }
   });
 
-  bot->proccesMessage("8 часов", [](long UserID, String text) {
+  bot->onMessage("8 часов", [](VKMessage& msg) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 28800;
       preferences.begin("bot-config", false);
       preferences.putInt("light_duration", light_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность света: 8 часов", LightingMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность света: 8 часов", LightingMenu);
       current_keyboard = "LightingMenu";
     }
   });
 
-  bot->proccesMessage("12 часов", [](long UserID, String text) {
+  bot->onMessage("12 часов", [](VKMessage& msg) {
     if (current_keyboard == "LightDurationMenu") {
       light_duration_value = 43200;
       preferences.begin("bot-config", false);
       preferences.putInt("light_duration", light_duration_value);
       preferences.end();
-      bot->sendWithKeyboard(UserID, "✅ Длительность света: 12 часов", LightingMenu);
+      bot->sendWithKeyboard(msg.peerId, "✅ Длительность света: 12 часов", LightingMenu);
       current_keyboard = "LightingMenu";
     }
   });
 
-  bot->proccesMessage("СИСТЕМНЫЕ НАСТРОЙКИ🔃", [](long UserID, String text) {
-    bot->send(UserID, "🔄 Вход в режим конфигурации...\n\nДанные сохранены!\nСеть ArtWAT_system запускается.\n\nПодключитесь к данной сети WiFi чтобы открыть системные настройки");
+  bot->onMessage("СИСТЕМНЫЕ НАСТРОЙКИ🔃", [](VKMessage& msg) {
+    bot->send(msg.peerId, "🔄 Вход в режим конфигурации...\n\nДанные сохранены!\nСеть ArtWAT_system запускается.\n\nПодключитесь к данной сети WiFi чтобы открыть системные настройки");
     delay(1000);
-    
+
     preferences.begin("bot-config", false);
     preferences.putBool("goto_config", true);
     preferences.end();
-    
+
     ESP.restart(); 
   });
 
-  bot->proccesMessage("НАЗАД↩️", [](long UserID, String text) {
-    if (current_keyboard == "WaterDurationMenu") {
+  bot->onMessage("НАЗАД↩️", [](VKMessage& msg) {
+    if (current_keyboard == "TimeEditMenu") {
+      waitingForWaterTime = false;
+      waitingUserId = 0;
+      activeWaterSlot = -1;
+      current_keyboard = "WateringTimeMenu";
+      bot->sendWithKeyboard(msg.peerId, buildWaterSlotsText(), WateringTimeMenu);
+    } else if (current_keyboard == "WateringTimeMenu") {
       current_keyboard = "WateringMenu";
-      bot->sendWithKeyboard(UserID, "ПОЛИВ💧 НАСТРОЙКИ", WateringMenu);
+      bot->sendWithKeyboard(msg.peerId, "ПОЛИВ💧 НАСТРОЙКИ", WateringMenu);
+    } else if (current_keyboard == "WaterDurationMenu") {
+      current_keyboard = "WateringMenu";
+      bot->sendWithKeyboard(msg.peerId, "ПОЛИВ💧 НАСТРОЙКИ", WateringMenu);
     } else if (current_keyboard == "LightDurationMenu") {
       current_keyboard = "LightingMenu";
-      bot->sendWithKeyboard(UserID, "СВЕТ💡 НАСТРОЙКИ", LightingMenu);
+      bot->sendWithKeyboard(msg.peerId, "СВЕТ💡 НАСТРОЙКИ", LightingMenu);
     } else if (current_keyboard == "WateringMenu") {
       current_keyboard = "SettingsMenu";
-      bot->sendWithKeyboard(UserID, "НАСТРОЙКИ⚙️", SettingsMenu);
+      bot->sendWithKeyboard(msg.peerId, "НАСТРОЙКИ⚙️", SettingsMenu);
     } else if (current_keyboard == "LightingMenu") {
       current_keyboard = "SettingsMenu";
-      bot->sendWithKeyboard(UserID, "НАСТРОЙКИ⚙️", SettingsMenu);
+      bot->sendWithKeyboard(msg.peerId, "НАСТРОЙКИ⚙️", SettingsMenu);
     } else if (current_keyboard == "SettingsMenu") {
       current_keyboard = "MainMenu";
-      bot->sendWithKeyboard(UserID, "ГЛАВНОЕ МЕНЮ🌱", MainMenu);
+      bot->sendWithKeyboard(msg.peerId, "ГЛАВНОЕ МЕНЮ🌱", MainMenu);
     } else {
       current_keyboard = "MainMenu";
-      bot->sendWithKeyboard(UserID, "ГЛАВНОЕ МЕНЮ🌱", MainMenu);
+      bot->sendWithKeyboard(msg.peerId, "ГЛАВНОЕ МЕНЮ🌱", MainMenu);
     }
+  });
+
+  // ===== УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК =====
+  bot->onAnyMessage([](VKMessage& msg) {
+    // Сброс состояния, если пользователь ушёл из меню ввода другим путём
+    if (activeWaterSlot >= 0 && current_keyboard != "TimeEditMenu") {
+      activeWaterSlot = -1;
+      waitingForWaterTime = false;
+      waitingUserId = 0;
+    }
+
+    // --- 1. Режим ввода времени полива (слот) ---
+    if (waitingForWaterTime && msg.fromId == waitingUserId && activeWaterSlot >= 0) {
+      String t = msg.text;
+
+      if (t.length() == 5 && t[2] == ':') {
+        int hh = t.substring(0, 2).toInt();
+        int mm = t.substring(3, 5).toInt();
+        if (hh >= 0 && hh < 24 && mm >= 0 && mm < 60) {
+          bool duplicate = false;
+          for (int i = 0; i < WATER_SLOTS; i++) {
+            if (i != activeWaterSlot && waterSlots[i] == t) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (duplicate) {
+            bot->send(msg.peerId, "⚠️ Это время уже стоит в другом слоте");
+            return;
+          }
+
+          int slot = activeWaterSlot;
+          waterSlots[slot] = t;
+          saveWaterSlots();
+
+          waitingForWaterTime = false;
+          waitingUserId = 0;
+          activeWaterSlot = -1;
+
+          current_keyboard = "WateringTimeMenu";
+          bot->sendWithKeyboard(msg.peerId,
+            "✅ Слот сохранён!\n\n" + buildWaterSlotsText(),
+            WateringTimeMenu);
+          return;
+        }
+      }
+
+      bot->send(msg.peerId,
+        "⚠️ Неверный формат времени.\n\n"
+        "Введите время в формате ЧЧ:ММ\n"
+        "Например: 09:00, 14:20, 17:15");
+      return;
+    }
+
+    // --- 2. Режим ввода времени света (один слот) ---
+    if (waitingForLightTime && msg.fromId == waitingLightUserId) {
+      String t = msg.text;
+
+      if (t.length() == 5 && t[2] == ':') {
+        int hh = t.substring(0, 2).toInt();
+        int mm = t.substring(3, 5).toInt();
+        if (hh >= 0 && hh < 24 && mm >= 0 && mm < 60) {
+          waitingForLightTime = false;
+          waitingLightUserId = 0;
+          lightTime = t;
+
+          preferences.begin("bot-config", false);
+          preferences.putString("light_time", lightTime);
+          preferences.end();
+
+          current_keyboard = "LightingMenu";
+          bot->sendWithKeyboard(msg.peerId,
+            "✅ Время включения света установлено: " + lightTime, LightingMenu);
+          return;
+        }
+      }
+
+      bot->send(msg.peerId,
+        "⚠️ Неверный формат времени.\n\n"
+        "Введите время в формате ЧЧ:ММ\n"
+        "Например: 09:00, 14:20, 17:45");
+      return;
+    }
+
+    // --- 3. Обычная опечатка / неизвестная команда ---
+    bot->send(msg.peerId,
+      "🤔 Неизвестная команда.\n"
+      "Используйте кнопки меню или напишите СТАТУС📊");
   });
 }
 
@@ -726,79 +1055,94 @@ void initBotAndMenus() {
 
 void tryConnectWiFi() {
   Serial.println("📶 Попытка подключения к Wi-Fi...");
-  
+
   preferences.begin("bot-config", true);
   String ssid = preferences.getString("ssid", "");
   String password = preferences.getString("password", "");
   preferences.end();
-  
+
+  ssid.trim();
+  password.trim();
+
   if (ssid.length() == 0) {
     Serial.println("⚠️ Wi-Fi не настроен.");
     lastWifiAttempt = millis();
     return;
   }
-  
+
+  Serial.print("SSID: ["); Serial.print(ssid); Serial.println("]");
+  Serial.print("Heap: "); Serial.println(ESP.getFreeHeap());
+
+  WiFi.disconnect(true, false);
+  delay(500);
+
   WiFi.mode(WIFI_STA);
+  delay(100);
+
   WiFi.begin(ssid.c_str(), password.c_str());
-  
+
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
     delay(500);
     Serial.print(".");
     attempts++;
   }
-  
+
+  Serial.println();
+  Serial.print("Статус: "); Serial.println(WiFi.status());
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\n✅ Wi-Fi подключен!");
     Serial.print("🌐 IP: ");
     Serial.println(WiFi.localIP());
     staConnected = true;
-    
+    systemError = false;
+
     if (bot == nullptr) {
       preferences.begin("bot-config", true);
       String token = preferences.getString("token", "");
       String groupId = preferences.getString("group_id", "");
-      int adminCount = preferences.getInt("admin_count", 0);
       preferences.end();
-      
+
       if (token.length() == 0 || groupId.length() == 0) {
         Serial.println("❌ Токен или Group ID пустые!");
-        Serial.println("Откройте веб-интерфейс и введите данные.");
+        systemError = true;
         return;
       }
-      
+
       bot = new VKassistent(token, groupId);
-      bot->connectWIFI(ssid, password);
       bot->begin();
-      
-      preferences.begin("bot-config", true);
-      for (int i = 0; i < adminCount; i++) {
-        String pKey = "admin_" + String(i);
-        String adminStr = preferences.getString(pKey.c_str(), "0");
-        long adminID = strtol(adminStr.c_str(), NULL, 10);
-        bot->addAdmin(adminID);
-      }
-      preferences.end();
-      
       initBotAndMenus();
-      
+
+      Serial.println("✅ Бот и меню инициализированы");
+
+      systemError = false;
+      triggerSuccessBlink();
+
       preferences.begin("bot-config", true);
-      String firstAdminStr = preferences.getString("admin_0", "0");
+      long lastPeer = preferences.getLong("last_peer", 0);
       preferences.end();
-      long firstAdminID = strtol(firstAdminStr.c_str(), NULL, 10);
-      
-      if (firstAdminID > 0) {
-        bot->sendWithKeyboard(firstAdminID, 
-          "🌱 Система автополива ArtWAT запущена!\n\n📅 Системное время:\n " + getCurrentDateTime() + "\n\nИспользуйте кнопки для управления.", 
+
+      if (lastPeer != 0) {
+        Serial.print("📤 Отправляю приветствие в peerId: ");
+        Serial.println(lastPeer);
+        bot->sendWithKeyboard(lastPeer,
+          "🌱 Система автополива ArtWAT запущена!\n\n"
+          "📅 Системное время:\n" + getCurrentDateTime() + "\n\n"
+          "Используйте кнопки для управления.",
           MainMenu
         );
+      } else {
+        Serial.println("ℹ️ Приветствие не отправлено — пользователь ещё не писал боту");
+        Serial.println("Напиши боту 'СТАТУС📊' в VK");
       }
     }
   } else {
-    Serial.println("\n❌ Не удалось подключиться.");
+    Serial.println("❌ Не удалось подключиться.");
     staConnected = false;
+    systemError = true;
   }
-  
+
   lastWifiAttempt = millis();
 }
 
@@ -857,7 +1201,12 @@ void serialPortReading() {
       Serial.println("Выполняю проверку параметров...");
       Serial.println();
       Serial.println("=== ПАРАМЕТРЫ СИСТЕМЫ ===");
-      Serial.print("Время полива: "); Serial.println(waterTime);
+      Serial.print("Времена полива: ");
+      for (int i = 0; i < WATER_SLOTS; i++) {
+        Serial.print(waterSlots[i].length() > 0 ? waterSlots[i] : "—");
+        if (i < WATER_SLOTS - 1) Serial.print(", ");
+      }
+      Serial.println();
       Serial.print("Длительность полива: "); Serial.println(String(water_duration_value / 60000));
       Serial.println();
       Serial.print("Время света: "); Serial.println(lightTime);
@@ -871,27 +1220,27 @@ void serialPortReading() {
     }
     else if (incomingString == "/save_params") {
       preferences.begin("bot-config", false);
-      preferences.putString("water_time", waterTime);
       preferences.putString("light_time", lightTime);
       preferences.putInt("water_duration", water_duration_value);
       preferences.putInt("light_duration", light_duration_value);
       preferences.end();
-      
+      saveWaterSlots();
+
       Serial.println("✅ Параметры сохранены в память!");
       Serial.println("-----");
     }
     else if (incomingString == "/relay_test") {
       Serial.println("Выполняю проверку выходов...");
       for (int i = 0; i < 10; i++) {
-        digitalWrite(4, HIGH);
-        digitalWrite(5, LOW);
+        startPump(true);
+        stopLight(true);
         delay(500);
-        digitalWrite(5, HIGH);
-        digitalWrite(4, LOW);
+        stopPump(true);
+        startLight(true);
         delay(500);
       }
-      digitalWrite(4, LOW);
-      digitalWrite(5, LOW);
+      stopPump(true);
+      stopLight(true);
       Serial.println("✅ Тест реле завершен");
     }
     else if (incomingString == "/reboot_system") {
@@ -976,43 +1325,59 @@ void GreetingSerial() {
 
 void setup() {
   Serial.begin(115200);
-  
+  delay(500);
+
+  Serial.println();
+  Serial.println("🔄 Загрузка системы ArtWAT...");
+
   pinMode(PUMP_PIN, OUTPUT);
   pinMode(LIGHT_PIN, OUTPUT);
-  digitalWrite(PUMP_PIN, HIGH);
-  digitalWrite(LIGHT_PIN, HIGH);
-  
+  pinMode(STATUS_LED_PIN, OUTPUT);
+
+  #if RELAY_ACTIVE_LOW
+    digitalWrite(PUMP_PIN, HIGH);
+    digitalWrite(LIGHT_PIN, HIGH);
+  #else
+    digitalWrite(PUMP_PIN, LOW);
+    digitalWrite(LIGHT_PIN, LOW);
+  #endif
+
+  digitalWrite(STATUS_LED_PIN, HIGH);
+  ledState = true;
+
   initRTC();
   loadSettings();
-  
+
   // ===== АППАРАТНЫЙ WATCHDOG =====
   esp_task_wdt_deinit();
-  
+
   esp_task_wdt_config_t wdt_config = {
       .timeout_ms = 90000,
       .idle_core_mask = 0,
       .trigger_panic = true
   };
-  
+
   esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
-  
+
   // ===== ПРОВЕРКА WI-FI =====
   if (configMode) {
     Serial.println("📡 Config Mode — AP Mode");
     startAPMode();
+    wifiLostTime = millis();
   } else {
     preferences.begin("bot-config", true);
     String stored_ssid = preferences.getString("ssid", "");
     preferences.end();
-    
+
     if (stored_ssid.length() == 0) {
       Serial.println("📡 Wi-Fi не настроен — AP Mode");
       startAPMode();
+      wifiLostTime = millis();
     } else {
       Serial.println("📶 Wi-Fi настроен — пытаюсь подключиться");
       tryConnectWiFi();
-      
+
       if (WiFi.status() != WL_CONNECTED) {
         Serial.println("📡 Не удалось подключиться — AP Mode");
         startAPMode();
@@ -1020,45 +1385,51 @@ void setup() {
       }
     }
   }
+
+  Serial.println("✅ setup() завершён");
 }
 
 // ===== LOOP =====
 
 void loop() {
   esp_task_wdt_reset();
-  
+
+  updateStatusLED();
+
   serialPortReading();
-  
+
   if (apMode) {
     dnsServer.processNextRequest();
     server.handleClient();
   }
-  
+
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck > 10000) {
     checkSchedule();
     lastCheck = millis();
   }
-  
+
   if (WiFi.status() == WL_CONNECTED) {
+    systemError = false;
+
     if (apMode) {
       stopAPMode();
       Serial.println("✅ Wi-Fi есть — AP Mode отключён");
     }
-    
+
     if (!staConnected) {
       staConnected = true;
       wifiLostTime = 0;
-      
+
       if (bot == nullptr) {
-        initBotAndMenus();
+        tryConnectWiFi();
       } else {
         bot->begin();
       }
-      
+
       Serial.println("✅ STA Mode — бот активирован");
     }
-    
+
     if (bot != nullptr) {
       bot->loop();
     }
@@ -1068,18 +1439,20 @@ void loop() {
       wifiLostTime = millis();
       Serial.println("⚠️ Wi-Fi потерян! Переход в автономный режим.");
     }
-    
+
     if (!apMode) {
       startAPMode();
       Serial.println("📡 AP Mode активирован");
+    } else {
+      systemError = false;
     }
-    
+
     if (millis() - lastWifiAttempt > 300000) {
       Serial.print("🔄 Попытка переподключения");
       tryConnectWiFi();
     }
   }
-  
+
   static unsigned long portOpenedTime = 0;
   if (!greeted) {
     if (portOpenedTime == 0) {
@@ -1090,6 +1463,6 @@ void loop() {
       greeted = true;
     }
   }
-  
+
   yield();
 }
