@@ -6,7 +6,7 @@
 //                                   by Arctic_WAWES
 // 
 //  Прошивка для серии моделей ArtWat (home edition) 
-//  Firmwork version: 1.7 DEMO
+//  Firmwork version: 1.7.1 DEMO
 //  Microcontroller: Wemos D1 R32 (ESP32 "UNO")
 // 
 //   Особенности:
