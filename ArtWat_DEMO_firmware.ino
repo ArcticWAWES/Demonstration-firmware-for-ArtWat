@@ -434,45 +434,378 @@ void loadWaterSlots() {
 
 // ===== HTML СТРАНИЦА =====
 
+// ===== HTML СТРАНИЦА =====
+
 void handleRoot() {
   preferences.begin("bot-config", true);
-  String s_ssid = preferences.getString("ssid", "");
-  String s_pass = preferences.getString("password", "");
+  String s_ssid  = preferences.getString("ssid", "");
+  String s_pass  = preferences.getString("password", "");
   String s_token = preferences.getString("token", "");
   String s_group = preferences.getString("group_id", "");
   preferences.end();
 
-  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>VKassistent</title></head>";
-  html += "<body style=\"font-family: Arial; max-width: 400px; margin: 20px auto; background: #f0f2f5; padding: 20px;\">";
-  html += "<h2 style=\"text-align: center;\">Системные настройки ArtWAT</h2>";
-  html += "<form action=\"/save\" method=\"POST\" style=\"background: white; padding: 20px; border-radius: 10px;\">";
+  // Сырая строка — HTML можно редактировать как обычно,
+  // без экранирования кавычек и переводов строк.
+  // Плейсхолдеры %%SSID%% и т.д. заменяются на сохранённые значения.
+  String html = R"rawliteral(<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ArtWat — Системные настройки</title>
+<style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 
-  html += "<label><b>Wi-Fi имя</b></label>";
-  html += "<input type=\"text\" name=\"ssid\" value=\"" + s_ssid + "\" required style=\"width: 100%; padding: 8px; margin: 6px 0 10px; box-sizing: border-box;\">";
+    :root {
+        --purple: #8d369f;
+        --purple-dark: #6d2880;
+        --purple-light: #f4e8f7;
+        --white: #ffffff;
+    }
 
-  html += "<label><b>Пароль Wi-Fi</b></label>";
-  html += "<input type=\"password\" name=\"password\" value=\"" + s_pass + "\" style=\"width: 100%; padding: 8px; margin: 6px 0 10px; box-sizing: border-box;\">";
+    html, body { margin: 0; padding: 0; }
 
-  html += "<label><b>Токен VK</b></label>";
-  html += "<input type=\"text\" name=\"token\" value=\"" + s_token + "\" required style=\"width: 100%; padding: 8px; margin: 6px 0 10px; box-sizing: border-box;\">";
+    body {
+        font-family: Arial, Helvetica, sans-serif;
+        background: #d8dde3;
+        color: #1a1a1a;
+        min-height: 100vh;
+    }
 
-  html += "<label><b>ID группы</b></label>";
-  html += "<input type=\"text\" name=\"group_id\" value=\"" + s_group + "\" required style=\"width: 100%; padding: 8px; margin: 6px 0 10px; box-sizing: border-box;\">";
+    .phone {
+        max-width: 440px;
+        margin: 0 auto;
+        background: #fafafa;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+    }
 
-  html += "<label><b>Установить время</b></label>";
-  html += "<div style=\"display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px;\">";
-  html += "<input type=\"number\" name=\"day\" placeholder=\"День\" min=\"1\" max=\"31\" style=\"width: 28%; padding: 8px; box-sizing: border-box;\">";
-  html += "<input type=\"number\" name=\"month\" placeholder=\"Мес\" min=\"1\" max=\"12\" style=\"width: 28%; padding: 8px; box-sizing: border-box;\">";
-  html += "<input type=\"number\" name=\"year\" placeholder=\"Год\" min=\"2000\" max=\"2099\" style=\"width: 36%; padding: 8px; box-sizing: border-box;\">";
-  html += "<input type=\"number\" name=\"hour\" placeholder=\"Час\" min=\"0\" max=\"23\" style=\"width: 47%; padding: 8px; box-sizing: border-box;\">";
-  html += "<input type=\"number\" name=\"minute\" placeholder=\"Мин\" min=\"0\" max=\"59\" style=\"width: 47%; padding: 8px; box-sizing: border-box;\">";
-  html += "</div>";
+    .header {
+        background: var(--purple);
+        color: var(--white);
+        padding: 26px 20px 22px;
+        text-align: center;
+    }
 
-  html += "<input type=\"submit\" value=\"Сохранить\" style=\"width: 100%; padding: 10px; background: #4c75a3; color: white; border: none; font-weight: bold; border-radius: 6px; cursor: pointer;\">";
-  html += "</form>";
-  html += "</body></html>";
+    .header .logo-text {
+        font-family: Arial, Helvetica, sans-serif;
+        font-size: 26px;
+        font-weight: bold;
+        color: var(--white);
+        letter-spacing: 0.3px;
+        line-height: 1.2;
+    }
 
-  server.send(200, "text/html", html);
+    .header .subtitle {
+        margin-top: 8px;
+        font-size: 13px;
+        opacity: 0.9;
+        letter-spacing: 0.3px;
+    }
+
+    .container { padding: 20px; flex: 1; }
+
+    .card {
+        background: white;
+        border-radius: 14px;
+        padding: 22px 20px;
+        margin-bottom: 16px;
+        box-shadow: 0 2px 10px rgba(141, 54, 159, 0.08);
+        border: 1px solid #f0e8f2;
+    }
+
+    .card h2 {
+        margin: 0 0 4px;
+        font-size: 17px;
+        font-weight: bold;
+        font-family: 'Arial Black', Arial, sans-serif;
+        color: var(--purple);
+        letter-spacing: -0.2px;
+    }
+
+    .card .card-sub {
+        margin: 0 0 18px;
+        font-size: 13px;
+        color: #888;
+        line-height: 1.4;
+    }
+
+    .field { margin-bottom: 16px; }
+
+    .field label {
+        display: block;
+        font-size: 12px;
+        color: var(--purple);
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        margin-bottom: 6px;
+        font-weight: bold;
+    }
+
+    .field input[type="text"],
+    .field input[type="password"],
+    .field input[type="number"] {
+        width: 100%;
+        padding: 13px 14px;
+        font-size: 14px;
+        font-family: Arial, sans-serif;
+        background: var(--purple-light);
+        border: 1px solid #e5d0ea;
+        border-radius: 10px;
+        color: #1a1a1a;
+        transition: border 0.15s, background 0.15s;
+    }
+
+    .field input:focus {
+        outline: none;
+        border-color: var(--purple);
+        background: #fff;
+    }
+
+    .field input::placeholder {
+        color: #b8a0c0;
+        font-size: 13px;
+    }
+
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    .row .field { flex: 1; min-width: 0; }
+    .row .field.day   { flex: 0 0 30%; }
+    .row .field.month { flex: 0 0 30%; }
+    .row .field.year  { flex: 0 0 36%; }
+    .row .field.hour   { flex: 0 0 48%; }
+    .row .field.minute { flex: 0 0 48%; }
+
+    button, input[type="submit"] {
+        width: 100%;
+        padding: 15px;
+        border: none;
+        border-radius: 10px;
+        font-size: 15px;
+        font-weight: bold;
+        font-family: Arial, sans-serif;
+        cursor: pointer;
+        transition: transform 0.1s, background 0.15s;
+        letter-spacing: 0.2px;
+    }
+
+    button:active, input[type="submit"]:active { transform: scale(0.98); }
+
+    .btn-primary {
+        background: var(--purple);
+        color: var(--white);
+        margin-top: 8px;
+    }
+
+    .btn-primary:active { background: var(--purple-dark); }
+
+    details {
+        margin-top: 12px;
+        border-radius: 10px;
+        border: 1px solid #e8eaed;
+        background: #f7f8fa;
+        padding: 0;
+    }
+
+    details summary {
+        padding: 12px 16px;
+        font-size: 13px;
+        font-weight: bold;
+        color: var(--purple);
+        cursor: pointer;
+        user-select: none;
+        list-style: none;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    details summary::-webkit-details-marker { display: none; }
+
+    details summary::after {
+        content: '+';
+        font-size: 20px;
+        color: var(--purple);
+        line-height: 1;
+    }
+
+    details[open] summary::after { content: '−'; }
+
+    details .details-body {
+        padding: 0 16px 16px;
+        font-size: 13px;
+        line-height: 1.6;
+        color: #555;
+    }
+
+    details .details-body ol { margin: 0; padding-left: 20px; }
+    details .details-body ol li { margin-bottom: 6px; }
+    details .details-body ol li:last-child { margin-bottom: 0; }
+    details .details-body b { color: var(--purple); }
+
+    .footer {
+        text-align: center;
+        padding: 16px;
+        font-size: 11px;
+        color: #aaa;
+    }
+</style>
+</head>
+<body>
+
+<div class="phone">
+
+    <div class="header">
+        <div class="logo-text">ArtWat — Настройка</div>
+        <div class="subtitle">Системные параметры автополива</div>
+    </div>
+
+    <div class="container">
+
+        <form action="/save" method="POST">
+
+            <div class="card">
+                <h2>Подключение к Wi-Fi</h2>
+                <p class="card-sub">Данные вашей домашней сети, к которой подключится устройство</p>
+
+                <div class="field">
+                    <label for="ssid">Имя сети (SSID)</label>
+                    <input type="text" id="ssid" name="ssid" required
+                           value="%%SSID%%"
+                           placeholder="Имя подключаемой сети Wi-Fi"
+                           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                </div>
+
+                <div class="field">
+                    <label for="password">Пароль Wi-Fi</label>
+                    <input type="password" id="password" name="password"
+                           value="%%PASS%%"
+                           placeholder="Пароль от домашнего Wi-Fi"
+                           autocomplete="new-password">
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Сообщество ВКонтакте</h2>
+                <p class="card-sub">Данные, полученные в приложении ArtWat Setup</p>
+
+                <div class="field">
+                    <label for="token">Токен доступа (Access Token)</label>
+                    <input type="text" id="token" name="token" required
+                           value="%%TOKEN%%"
+                           placeholder="vk1.a.XXXXXXXXX..."
+                           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                </div>
+
+                <div class="field">
+                    <label for="group_id">ID сообщества (Group ID)</label>
+                    <input type="text" id="group_id" name="group_id" required
+                           value="%%GROUP%%"
+                           placeholder="XXXXXXXXXX"
+                           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Системное время (RTC)</h2>
+                <p class="card-sub">Установите текущее время для корректной работы расписания. Если оставить поля пустыми — время не изменится.</p>
+
+                <div class="row">
+                    <div class="field day">
+                        <label for="day">День</label>
+                        <input type="number" id="day" name="day" min="1" max="31" placeholder="14">
+                    </div>
+                    <div class="field month">
+                        <label for="month">Мес</label>
+                        <input type="number" id="month" name="month" min="1" max="12" placeholder="10">
+                    </div>
+                    <div class="field year">
+                        <label for="year">Год</label>
+                        <input type="number" id="year" name="year" min="2000" max="2099" placeholder="2026">
+                    </div>
+                </div>
+
+                <div class="row">
+                    <div class="field hour">
+                        <label for="hour">Час</label>
+                        <input type="number" id="hour" name="hour" min="0" max="23" placeholder="15">
+                    </div>
+                    <div class="field minute">
+                        <label for="minute">Мин</label>
+                        <input type="number" id="minute" name="minute" min="0" max="59" placeholder="30">
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <input type="submit" class="btn-primary" value="СОХРАНИТЬ И ПОДКЛЮЧИТЬСЯ">
+            </div>
+
+        </form>
+
+        <details>
+            <summary>Как получить токен и Group ID?</summary>
+            <div class="details-body">
+                <ol>
+                    <li>Откройте <b>Mini App «ArtWat Setup»</b> в ВКонтакте.</li>
+                    <li>Пройдите активацию: выберите сообщество, включите возможности ботов.</li>
+                    <li>На экране <b>«ГОТОВО!»</b> нажмите кнопку <b>«СКОПИРОВАТЬ ВСЁ»</b>.</li>
+                    <li>Вернитесь на эту страницу и вставьте данные в поля выше.</li>
+                </ol>
+                <p style="margin: 12px 0 0; font-size: 12px; color: #888;">
+                    Если у вас ещё нет сообщества ВКонтакте — создайте его заранее
+                    в приложении VK: раздел «Сообщества» → кнопка «СОЗДАТЬ».
+                </p>
+            </div>
+        </details>
+
+        <details>
+            <summary>Устройство не подключается к Wi-Fi</summary>
+            <div class="details-body">
+                <ol>
+                    <li>Проверьте, что сеть работает в диапазоне <b>2.4 ГГц</b>
+                        (устройство не поддерживает 5 ГГц).</li>
+                    <li>Убедитесь, что имя сети (SSID) введено точно, с учётом регистра.</li>
+                    <li>Если пароль содержит специальные символы — вводите их аккуратно.</li>
+                    <li>Если сеть скрыта — устройство её не найдёт, нужно временно
+                        сделать её видимой.</li>
+                </ol>
+            </div>
+        </details>
+
+        <details>
+            <summary>Бот не отвечает в VK</summary>
+            <div class="details-body">
+                <ol>
+                    <li>Проверьте, что в сообществе включены <b>«Возможности ботов»</b>:
+                        Управление → Сообщения → Настройки для бота.</li>
+                    <li>Убедитесь, что написали боту хотя бы одно сообщение — так
+                        устройство запомнит ваш peer_id.</li>
+                    <li>Если ничего не помогло — подключитесь по проводу к микроконтроллеру,
+                        зайдите в Serial-монитор (115200 бод), войдите в режим разработчика,
+                        введя персональный пароль системы (<b>/login</b>), и далее передайте
+                        команду <b>/check_parametrs</b> для диагностики устройства.</li>
+                </ol>
+            </div>
+        </details>
+
+    </div>
+
+    <div class="footer">ArtWat © 2025 · Управление автополивом через VK</div>
+
+</div>
+
+</body>
+</html>)rawliteral";
+
+  // Подстановка сохранённых значений в поля формы
+  html.replace("%%SSID%%",  s_ssid);
+  html.replace("%%PASS%%",  s_pass);
+  html.replace("%%TOKEN%%", s_token);
+  html.replace("%%GROUP%%", s_group);
+
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
 void loadSettings() {
